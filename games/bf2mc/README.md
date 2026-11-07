@@ -15,73 +15,13 @@ An experimental port of the Xbox 360 version of Battlefield 2: Modern Combat, bu
 
 ## How to play
 
-> [!IMPORTANT]
-> **There is no ready-to-play download.** This page has only tools: they turn *your own* game disc into a PC game,
-> on your computer. The first time takes a while (20-60 minutes on a recent PC), mostly waiting.
-> After that, you just double-click to play.
+This port is built from **your own disc**. Clone [rexglue-ports](https://github.com/batatinhafcbatatinha-pixel/rexglue-ports) with its submodules
+(`git clone --recursive https://github.com/batatinhafcbatatinha-pixel/rexglue-ports.git`), then in `games/bf2mc` run `Setup.cmd`: it installs the build
+tools, asks for your disc image or extracted files, checks them and builds the port. Then play with the
+`Play-*.cmd` in that folder.
 
-**You need**
-
-- **Windows 10 or 11** (64-bit) with about **23 GB** free. (Linux and Mac: see below.)
-- Your own **Battlefield 2: Modern Combat** (Xbox 360, USA), as a disc image (`.iso`) made from your disc, or its extracted
-  files. Other versions are not accepted; the setup checks this for you.
-
-**Steps**
-
-**Easiest: `Setup.exe`.** Open [Releases](https://github.com/batatinhafcbatatinha-pixel/bf2-modern-combat-pc/releases), download **`Setup.exe`** from the newest one and run it.
-It downloads this kit (source code only), shows what your PC already has and what is missing on its
-*Dependencies* tab, installs what is missing, asks for your `.iso` and builds the game. Afterwards the same
-program (and its desktop shortcut) is your launcher: **Play**, and **PC settings** (the same options as F1 in
-the game, before it starts). Windows may say it protected your PC because the program is not signed: click
-*More info* > *Run anyway*. The program is built by GitHub from [tools/launcher](tools/launcher); nothing from the game is in it.
-
-**Or step by step:**
-
-1. **Download**, one of these two ways:
-   <details open><summary><b>Easiest: the ZIP</b></summary>
-
-   Open [Releases](https://github.com/batatinhafcbatatinha-pixel/bf2-modern-combat-pc/releases/latest), download **`bf2-modern-combat-pc-source-kit.zip`** and extract it to a short folder, such as
-   `C:\Games\bf2-modern-combat-pc`.
-   </details>
-   <details><summary><b>With Git: always the newest version</b></summary>
-
-   ```powershell
-   git clone --recursive https://github.com/batatinhafcbatatinha-pixel/bf2-modern-combat-pc.git C:\Games\bf2-modern-combat-pc
-   ```
-   To update later: `git pull --recurse-submodules`, then run `Setup.cmd` again.
-   </details>
-
-2. **Double-click `Setup.cmd`.** It asks before installing anything, then:
-   - installs Python and Microsoft's C++ Build Tools if you don't have them (free; Windows asks for permission once);
-   - downloads the other build tools (about 1 GB) **into this folder only**;
-   - opens a window where you **pick your `.iso`**: it checks the version and copies the game files;
-   - builds your PC version, and offers a desktop shortcut.
-
-   If anything stops, run `Setup.cmd` again: finished steps are skipped.
-
-3. **Play:** double-click **`Play-BF2MC.cmd`** (or the desktop shortcut).
-
-**In the game:** **F1** opens the PC settings. Controllers and the keyboard work: see [Controls](#controls).
-
-**Problems?** Open an [issue](https://github.com/batatinhafcbatatinha-pixel/bf2-modern-combat-pc/issues) with `setup-log.txt` and a screenshot. Never attach game files.
-
-`Setup.cmd` is new: so far it has been tried from a fresh download only with the FIFA Street 3 port. If it stops for you, please open an issue with `setup-log.txt`.
-
-<details><summary><b>Linux and Mac</b></summary>
-
-- **Linux:** works natively (no Wine), but the setup is by hand for now: see [Linux](#linux).
-- **Mac:** not playable yet. The Mac build files are an experiment that has never been compiled or run on a Mac. Details in [MACOS.md](MACOS.md); if you have a Mac and want to help test, open an issue.
-
-</details>
-
-<details><summary><b>Questions</b></summary>
-
-- **Is this legal?** This page contains no game, only tools. You use the game you already own.
-- **Can I share my built game?** No: it contains the game's code. Keep it on your PC.
-- **Will it run on my PC?** Any graphics card with DirectX 11 should work. Measured: about 50-79 fps in the first mission at 4K on a Ryzen 5 3600 + RTX 3050 Laptop.
-- **How do I remove it?** Delete the folder. Python and the Build Tools can be removed in Windows Settings > Apps.
-
-</details>
+**Problems?** Open an [issue](https://github.com/batatinhafcbatatinha-pixel/rexglue-ports/issues) naming the game, with `setup-log.txt` and a screenshot.
+Never attach game files.
 
 ## Status
 
