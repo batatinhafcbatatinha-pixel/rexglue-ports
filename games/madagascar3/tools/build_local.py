@@ -242,6 +242,7 @@ def main():
     run([cmake, '-S', project, '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=RelWithDebInfo',
          '-DCMAKE_C_COMPILER=' + clang, '-DCMAKE_CXX_COMPILER=' + clangxx,
          '-DCMAKE_PREFIX_PATH=' + sdk.as_posix(),
+         '-DPORTS_SHARED=' + (ROOT.parents[1] / 'shared').as_posix(),  # project/ is built from a copy
          *(['-DDXVK_DIR=' + prepare_dxvk(local).as_posix()] if DXVK and os.name == 'nt' else []),
          *(['-DDXMT_DIR=' + args.dxmt_dir.resolve().as_posix(), '-DCMAKE_OSX_ARCHITECTURES=x86_64'] if MACOS else []),
          *(['-DDXVK_NATIVE_DIR=' + args.dxvk_native_dir.resolve().as_posix()] if os.name != 'nt' and not MACOS else [])], local, env)

@@ -3,10 +3,10 @@
 [project]
 name = "fifastreet3"
 sdk_version = "0.10.0"
-game_root = "d:/fifa-street3-game"
+game_root = "@GAME_FILES@"
 
 [entrypoint]
-file_path = "d:/fifa-street3-game/default.xex"
+file_path = "@GAME_FILES@/default.xex"
 out_directory_path = "generated/default"
 includes = []
 setjmp_address = 0x82580FD0

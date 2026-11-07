@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.25)
 project(doritoscrashcourse LANGUAGES CXX)
 # Native layers shared by the ports (../../../shared).
-set(PORTS_SHARED "${CMAKE_CURRENT_SOURCE_DIR}/../../../shared")
+set(PORTS_SHARED "${CMAKE_CURRENT_SOURCE_DIR}/../../../shared" CACHE PATH
+    "Native layers shared by the ports (tools/build_local.py passes it when it builds a copy of project/)")
 # This game's own sources first (port_game.h and the headers the shared files include).
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src ${PORTS_SHARED}/src ${PORTS_SHARED}/src/native_audio ${PORTS_SHARED}/src/native_gpu ${PORTS_SHARED}/src/platform)
 

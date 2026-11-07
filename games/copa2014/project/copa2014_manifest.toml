@@ -3,10 +3,10 @@
 [project]
 name = "copa2014"
 sdk_version = "0.10.0"
-game_root = "d:/copa2014-game"
+game_root = "@GAME_FILES@"
 
 [entrypoint]
-file_path = "d:/copa2014-game/default.xex"
+file_path = "@GAME_FILES@/default.xex"
 out_directory_path = "generated/default"
 includes = []
 # CRT setjmp/longjmp (setjmp: lis/lwz/bnectr then saves f14-f31, r13-r31; longjmp calls RtlUnwind)
@@ -334,7 +334,7 @@ longjmp_address = 0x839E72B0
 
 [[modules]]
 guest_path = "dlc/dlc_FootballCompEng/dlc/FootballCompEng/FootballCompEngzf.xex.dll"
-file_path = "d:/copa2014-game/dlc/dlc_FootballCompEng/dlc/FootballCompEng/FootballCompEngzf.xex.dll"
+file_path = "@GAME_FILES@/dlc/dlc_FootballCompEng/dlc/FootballCompEng/FootballCompEngzf.xex.dll"
 out_directory_path = "generated/footballcompengzf"
 includes = []
 
@@ -344,7 +344,7 @@ includes = []
 
 [[modules]]
 guest_path = "dlc/dlc_powdll/dlc/powdll/powdllzf.xex.dll"
-file_path = "d:/copa2014-game/dlc/dlc_powdll/dlc/powdll/powdllzf.xex.dll"
+file_path = "@GAME_FILES@/dlc/dlc_powdll/dlc/powdll/powdllzf.xex.dll"
 out_directory_path = "generated/powdllzf"
 includes = []
 

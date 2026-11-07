@@ -3,10 +3,10 @@
 [project]
 name = "fifastreet4"
 sdk_version = "0.10.0"
-game_root = "../analysis/executables"
+game_root = "@GAME_FILES@"
 
 [entrypoint]
-file_path = "../analysis/executables/default.xex"
+file_path = "@GAME_FILES@/default.xex"
 out_directory_path = "generated/default"
 includes = []
 
@@ -50,7 +50,7 @@ includes = []
 
 [[modules]]
 guest_path = "fifadllzf.xex.dll"
-file_path = "../analysis/executables/fifadllzf.xex.dll"
+file_path = "@GAME_FILES@/fifadllzf.xex.dll"
 out_directory_path = "generated/fifadllzf_xex"
 # CRT setjmp/longjmp of the game module (same code as FIFA Street 3, located by signature).
 setjmp_address = 0x83576BC0

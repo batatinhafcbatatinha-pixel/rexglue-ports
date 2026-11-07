@@ -3,10 +3,10 @@
 [project]
 name = "bf2mc"
 sdk_version = "0.10.0"
-game_root = "assets"
+game_root = "@GAME_FILES@"
 
 [entrypoint]
-file_path = "assets/default.xex"
+file_path = "@GAME_FILES@/default.xex"
 out_directory_path = "generated/default"
 includes = ["bf2mc_config.toml", "bf2mc_hooks.toml"]
 
