@@ -8,6 +8,26 @@ What the ports add on top of the recompiled code is native: a Direct3D 11 render
 DXVK native on Linux, DXMT on macOS), XMA audio decoded on the host, the in-game PC settings menu (F1) and
 modern keyboard, mouse and controller input. The SDK's GPU emulation is not used.
 
+## How to play a game
+
+Windows 10/11 x64. About 15 GB free and 15-60 minutes for the first build of a game.
+
+1. Get this repository, either way:
+   - `git clone --recurse-submodules https://github.com/batatinhafcbatatinha-pixel/rexglue-ports.git`, or
+   - **Code > Download ZIP** and unpack it, or
+   - only [`Launcher.exe`](https://github.com/batatinhafcbatatinha-pixel/port-installer/releases/latest/download/Launcher.exe):
+     run it, pick rexglue-ports and a folder, and it downloads this repository there.
+2. Run **`Launcher.cmd`** (it downloads `Launcher.exe` from the
+   [port-installer releases](https://github.com/batatinhafcbatatinha-pixel/port-installer/releases) the first time).
+3. Click **CHOOSE ISO...** and pick your disc image (Redump `.iso` or XISO). The game is recognised from its `default.xex`.
+4. Confirm **Install**. The launcher installs what is missing (Python, Visual Studio C++ Build Tools, LLVM/Clang, CMake,
+   Ninja), copies and checks the game files, translates the game code and compiles it. Finished steps are skipped next
+   time. Log: **Install** tab and `games/<game>/setup-log.txt`.
+5. **PLAY**. **PC settings** in the launcher, or the in-game F1 menu: display mode, monitor, refresh rate, V-Sync,
+   frame limit, internal resolution, MSAA, effects, controls, language, volume.
+
+Each game folder also keeps its own `Setup.cmd`, which does the same for that one game.
+
 ## Layout
 
 | Folder | What it holds |
@@ -15,6 +35,7 @@ modern keyboard, mouse and controller input. The SDK's GPU emulation is not used
 | [`games/`](games/) | one folder per game: its manifest, hooks, game-specific native code, build and play scripts |
 | [`shared/src/`](shared/src/) | the native layers the games share (see below) |
 | `tools/port-installer` | the game-file installer / launcher (submodule: `git submodule update --init`) |
+| `launcher.json`, `Launcher.cmd` | the launcher's list of games and its download script |
 
 Shared layers (`shared/src`):
 
@@ -38,10 +59,11 @@ as before.
 | [Battlefield 2: Modern Combat](games/bf2mc/) | Xbox 360 | playable |
 | [Madagascar 3](games/madagascar3/) | Xbox 360 | reaches gameplay |
 | [2014 FIFA World Cup Brazil](games/copa2014/) | Xbox 360 | in progress |
-| [Doritos Crash Course](games/doritos/) | Xbox 360 (XBLA) | early work |
-| [2010 FIFA World Cup South Africa](games/wc2010/) | Xbox 360 | early work |
+| [Doritos Crash Course](games/doritos/) | Xbox 360 (XBLA) | early work, not in the launcher yet |
+| [2010 FIFA World Cup South Africa](games/wc2010/) | Xbox 360 | early work, not in the launcher yet |
 
-Each game folder has its own README with how to build and play it (`Setup.cmd` where present).
+Only these exact discs are supported (checked by SHA-256, see each `games/<game>/installer.json`). Each game folder
+has its own README with how to build and play it.
 
 ## Screenshots
 
