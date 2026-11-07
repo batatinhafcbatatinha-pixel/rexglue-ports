@@ -43,6 +43,22 @@ as before.
 
 Each game folder has its own README with how to build and play it (`Setup.cmd` where present).
 
+## Screenshots
+
+Each port at the furthest point it reaches today.
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/screenshots/wc2010.jpg" alt="2010 FIFA World Cup South Africa" width="100%"><br>
+      <b>2010 FIFA World Cup South Africa</b><br>
+      <sub>Xbox 360 &middot; choosing sides before a match</sub>
+    </td>
+  </tr>
+</table>
+
+More screenshots are on the way as each port is captured again.
+
 ## License
 
 The ports' own code and tooling: MIT ([LICENSE](LICENSE)); third-party notices in each game's `NOTICE.md` and
