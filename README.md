@@ -98,7 +98,7 @@ Each port at the furthest point it reaches today.
     <td align="center" width="50%">
       <img src="docs/screenshots/copa2014.jpg" alt="2014 FIFA World Cup Brazil" width="100%"><br>
       <b>2014 FIFA World Cup Brazil</b><br>
-      <sub>Xbox 360 &middot; a skill game (Ground Pass)</sub>
+      <sub>Xbox 360 &middot; a match, Brazil against Argentina</sub>
     </td>
     <td align="center" width="50%">
       <img src="docs/screenshots/wc2010.jpg" alt="2010 FIFA World Cup South Africa" width="100%"><br>
