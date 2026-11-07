@@ -1,0 +1,11 @@
+# title appears 28-42 s after start
+50 A 300
+# single player -> USA -> level 1
+62 A 300
+72 A 300
+82 A 300
+# not-signed-in dialog: B = continue
+94 B 300
+# gameplay
+115 RT 10000
+117 LX=1 3000

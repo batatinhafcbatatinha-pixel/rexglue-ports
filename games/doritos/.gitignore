@@ -1,0 +1,15 @@
+game_files/
+generated/
+build/
+analysis/raw/
+analysis/package-sha256.txt
+analysis/
+project/generated/
+project/out/
+*.exe
+*.xex
+*.iso
+*.bin
+*.pdb
+__pycache__/
+*.pyc

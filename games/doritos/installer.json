@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "name": "Doritos Crash Course",
+  "revision": "Xbox 360 XBLA",
+  "filesystem": "stfs",
+  "destination": "game_files",
+  "required_files": {
+    "default.xex": "6c4fa5a12ef2ad51db4809d5d654b487300a1ace06c2cdf6cb14258fd273dfc1"
+  },
+  "required_paths": [],
+  "expected_files": {
+    "achievement01.png": 6129,
+    "achievement02.png": 5701,
+    "achievement03.png": 5940,
+    "achievement04.png": 6855,
+    "achievement05.png": 5690,
+    "achievement06.png": 6261,
+    "achievement07.png": 6043,
+    "achievement08.png": 5171,
+    "achievement09.png": 5805,
+    "achievement10.png": 5668,
+    "achievement11.png": 5377,
+    "achievement12.png": 6164,
+    "ArcadeInfo.xml": 2308,
+    "data.pak": 55672832,
+    "default.xex": 4501504,
+    "game.png": 10634,
+    "gamerpicture1big.png": 6003,
+    "gamerpicture1small.png": 921,
+    "gamerpicture2big.png": 3136,
+    "gamerpicture2small.png": 2134,
+    "game_bkgnd.jpg": 459931,
+    "game_boxart.jpg": 199448,
+    "game_marketplace.png": 78328,
+    "kmrb_91.png": 4542
+  }
+}

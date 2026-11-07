@@ -1,0 +1,59 @@
+{
+  "repo": "madagascar-3-pc",
+  "game": "Madagascar 3: The Video Game",
+  "revision": "Xbox 360",
+  "required_files": {
+    "default.xex": "38d0d7e6665c89567b0566dff387d2925a0b7f001367b99fe08bfd48e32fd1a0"
+  },
+  "required_paths": [],
+  "project_dir": "project",
+  "manifest": "madagascar3_manifest.toml",
+  "target": "madagascar3",
+  "extra_targets": [],
+  "copy": [
+    "project"
+  ],
+  "ffmpeg_dest": "project/third_party/ffmpeg/include",
+  "play_args": [],
+  "game_root_tokens": [
+    "../game_files"
+  ],
+  "sdk": {
+    "version": "0.10.0.24-dev.gbd833a2 (nightly 2026-10-02)",
+    "url": "https://github.com/rexglue/rexglue-sdk/releases/download/nightly-20261002-bd833a2a/rexglue-sdk-0.10.0.24-dev.gbd833a2-win-amd64.zip",
+    "sha256": "1e19d7ec9be0d9d7e1a0088a34a33b068d4dea520181e81318528ef3b37627e7",
+    "folder": "win-amd64",
+    "patches": [
+      {
+        "name": "rexglue-fpscr-mask",
+        "file": "include/rex/ppc/context.h",
+        "old": "  inline void setcsr(uint32_t csr) noexcept { Platform::setcsr(csr); }\n",
+        "new": "  // Port patch: never let a stale/zero cached csr unmask host FP exceptions\n  // (guest threads whose csr was never seeded hit STATUS_FLOAT_INEXACT_RESULT).\n  inline void setcsr(uint32_t value) noexcept {\n    Platform::InitHostExceptions(value);\n    csr = value;\n    Platform::setcsr(value);\n  }\n"
+      }
+    ]
+  },
+  "sdk_linux": {
+    "url": "https://github.com/rexglue/rexglue-sdk/releases/download/nightly-20261002-bd833a2a/rexglue-sdk-0.10.0.24-dev.gbd833a2-linux-amd64.zip",
+    "sha256": "0a56565221a4e75f91fc71f787d9299a0d0298127b970c8a88a292f8d3a3befe",
+    "folder": "linux-amd64"
+  },
+  "sdk_mac": {
+    "url": "https://github.com/rexglue/rexglue-sdk/releases/download/nightly-20261002-bd833a2a/rexglue-sdk-0.10.0.24-dev.gbd833a2-mac-amd64.zip",
+    "sha256": "17bdcebef6083b0cf01fede41fa5603d2d4c5f3049f675a02f20daa3532bc2a3",
+    "folder": "mac-amd64"
+  },
+  "ffmpeg": {
+    "commit": "0604b464c7cb4ebc94940cf1f324a3b26b87717c",
+    "url": "https://codeload.github.com/wmarti/FFmpeg/tar.gz/0604b464c7cb4ebc94940cf1f324a3b26b87717c"
+  },
+  "dxvk": {
+    "version": "3.1.1",
+    "url": "https://github.com/doitsujin/dxvk/releases/download/v3.1.1/dxvk-3.1.1.tar.gz",
+    "sha256": "40565b4a724aadc4433fa4e010b4b23916d9b1f1baeee64e17186db94f54e608"
+  },
+  "audit_exempt": [],
+  "binary_exempt": [
+    "project/fonts/PT_Sans-Web-Bold.ttf",
+    "project/fonts/PT_Sans-Web-Regular.ttf"
+  ]
+}

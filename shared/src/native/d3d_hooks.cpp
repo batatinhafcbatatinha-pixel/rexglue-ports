@@ -1,0 +1,1032 @@
+#include "port_game.h"
+#if PORT_GAME == PORT_GAME_COPA2014
+// Hooks on the XDK Direct3D library inside default.xex (compiled into the game
+// executable so they replace the generated weak symbols for direct and indirect calls).
+#else /* street4 wc2010 */
+// Hooks on the XDK Direct3D library inside fifadllzf.xex.dll (compiled into the game
+// module target so they replace the generated weak symbols for direct and indirect calls).
+#endif /* PORT_GAME */
+//
+// The D3D library still runs: it keeps its state shadows, builds its command segments in
+// memory nobody reads, and does its bookkeeping. These hooks add what the GPU used to do:
+//  - draw / resolve / present through the native D3D11 renderer;
+//  - publish timestamps immediately (rendering is synchronous);
+//  - deliver the CP interrupt callbacks it requests (frame flips, fences).
+#if PORT_GAME == PORT_GAME_COPA2014
+// Addresses: the FIFA Street (2012) port's functions located here by instruction matching
+// (NATIVE_PLAN.md); the ABIs are identical.
+#elif PORT_GAME == PORT_GAME_WC2010
+// Addresses: matched against FIFA Street 2012's library (scripts/match_functions.py,
+// align_libs.py); device offsets from analysis/device-offset-map.txt.
+#else /* street4 */
+// Addresses and ABIs: NATIVE_PLAN.md and hle/d3d_functions.json.
+#endif /* PORT_GAME */
+
+#include <rex/hook.h>
+#include "../pc_settings.h"
+#if PORT_GAME == PORT_GAME_COPA2014
+#else /* street4 wc2010 */
+#include "post_effects.h"
+#endif /* PORT_GAME */
+#include <rex/logging.h>
+#include <rex/memory.h>
+#include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xthread.h>
+#include <fmt/format.h>
+#include <string>
+
+#include <algorithm>
+#include <cstring>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#include "guest_device.h"
+#include "renderer.h"
+#if PORT_GAME == PORT_GAME_COPA2014
+#include "copa_graphics.h"
+#elif PORT_GAME == PORT_GAME_WC2010
+#include "wc2010_graphics.h"
+#else /* street4 */
+#include "street4_graphics.h"
+#endif /* PORT_GAME */
+
+#if PORT_GAME == PORT_GAME_COPA2014
+using namespace copa;
+#elif PORT_GAME == PORT_GAME_WC2010
+using namespace wc2010;
+#else /* street4 */
+using namespace street4;
+#endif /* PORT_GAME */
+
+namespace {
+
+std::atomic<uint32_t> g_device{0};
+
+// Diagnostics: per-hook call counters, logged every 2 s by a host thread.
+struct Counters {
+  std::atomic<uint64_t> draws{0}, inline_draws{0}, resolves{0}, presents{0}, clears{0},
+      callbacks{0}, timestamps{0}, kicks{0}, tiling{0};
+} g_counters;
+
+void StartStatsThread() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    std::thread([] {
+      while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+#if PORT_GAME == PORT_GAME_COPA2014
+        REXLOG_INFO("copa stats: draws={} inline={} resolves={} presents={} clears={} "
+#elif PORT_GAME == PORT_GAME_WC2010
+        REXLOG_INFO("wc2010 stats: draws={} inline={} resolves={} presents={} clears={} "
+#else /* street4 */
+        REXLOG_INFO("street4 stats: draws={} inline={} resolves={} presents={} clears={} "
+#endif /* PORT_GAME */
+                    "cp_callbacks={} timestamps={} kicks={} tiling={}",
+                    g_counters.draws.load(), g_counters.inline_draws.load(),
+                    g_counters.resolves.load(), g_counters.presents.load(),
+                    g_counters.clears.load(), g_counters.callbacks.load(),
+                    g_counters.timestamps.load(), g_counters.kicks.load(),
+                    g_counters.tiling.load());
+        // Last call return address of each guest thread (where it is waiting).
+        auto* ks = rex::Runtime::instance()->kernel_state();
+        std::string lrs;
+        for (uint32_t id = 1; id < 256; ++id) {
+          auto t = ks->GetThreadByID(id);
+          if (!t || !t->thread_state() || !t->thread_state()->context()) continue;
+          auto* c = t->thread_state()->context();
+          lrs += fmt::format(" [{} lr={:08X} r3={:08X}]", id, c->lr, c->r3.u32);
+        }
+#if PORT_GAME == PORT_GAME_COPA2014
+        REXLOG_INFO("copa threads:{}", lrs);
+#elif PORT_GAME == PORT_GAME_WC2010
+        REXLOG_INFO("wc2010 threads:{}", lrs);
+#else /* street4 */
+        REXLOG_INFO("street4 threads:{}", lrs);
+#endif /* PORT_GAME */
+        if (uint32_t d = g_device.load()) {
+          uint8_t* b = rex::Runtime::instance()->memory()->virtual_membase();
+          uint32_t blk = LoadBE32(GuestPtr(b, d + dev::kStatusBlock));
+#if PORT_GAME == PORT_GAME_COPA2014
+          REXLOG_INFO("copa device {:08X}: 2B90={} ts={:08X} done={:08X} flags2B3C={:02X} 2B3D={:02X}",
+                      d, LoadBE32(GuestPtr(b, d + 0x2B90)),
+#elif PORT_GAME == PORT_GAME_WC2010
+          REXLOG_INFO("wc2010 device {:08X}: 2B04={} ts={:08X} done={:08X} flags2ABC={:02X} 2ABD={:02X}",
+                      d, LoadBE32(GuestPtr(b, d + 0x2B04)),
+#else /* street4 */
+          REXLOG_INFO("street4 device {:08X}: 5FF8={:08X} 55A4={:08X} 5CC8={:08X} 5F38={:08X} 2B90={} ts={:08X} done={:08X} flags2B3C={:02X} 2B3D={:02X}",
+                      d, LoadBE32(GuestPtr(b, d + 0x5FF8)), LoadBE32(GuestPtr(b, d + 0x55A4)), LoadBE32(GuestPtr(b, d + 0x5CC8)),
+                      LoadBE32(GuestPtr(b, d + 0x5F38)), LoadBE32(GuestPtr(b, d + 0x2B90)),
+#endif /* PORT_GAME */
+                      LoadBE32(GuestPtr(b, d + dev::kTimestamp)), blk ? LoadBE32(GuestPtr(b, blk)) : 0,
+#if PORT_GAME == PORT_GAME_WC2010
+                      *GuestPtr(b, d + 0x2ABC), *GuestPtr(b, d + 0x2ABD));
+#else /* street4 copa2014 */
+                      *GuestPtr(b, d + 0x2B3C), *GuestPtr(b, d + 0x2B3D));
+#endif /* PORT_GAME */
+        }
+      }
+    }).detach();
+  });
+}
+
+void StoreBE32(uint8_t* base, uint32_t address, uint32_t value) {
+  uint32_t v = rex::byte_swap(value);
+  std::memcpy(GuestPtr(base, address), &v, 4);
+}
+
+// Inline vertex data started with BeginVertices and finished by EndVertices (or by the
+// DrawVerticesUP wrapper, which ends it inline).
+struct PendingInline {
+  bool active = false;
+  uint32_t device = 0;
+  DrawRequest draw;
+} g_pending;
+
+void FlushPending(uint8_t* base) {
+  if (!g_pending.active) return;
+  g_pending.active = false;
+  GuestDevice dev(base, g_pending.device);
+  Renderer::Get().Draw(dev, g_pending.draw);
+}
+
+}  // namespace
+
+// ----------------------------------------------------------------------------- sync
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_8244DB48);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_827320F0);
+#else /* street4 */
+REX_EXTERN(__imp__sub_82714060);
+#endif /* PORT_GAME */
+// Ends a command segment and asks the GPU to write the timestamp / ring position into the
+// status block. Rendering is synchronous, so everything issued so far is complete: the
+// completed timestamp published is the library's current one (fences are never ahead).
+// Not while the library's command-buffer workers (async command buffer calls, tiling
+#if PORT_GAME == PORT_GAME_WC2010
+// replay) still own submitted segments (device+0x2B04 > 0): completing early lets the
+#else /* street4 copa2014 */
+// replay) still own submitted segments (device+0x2B90 > 0): completing early lets the
+#endif /* PORT_GAME */
+// library reuse segment memory the workers are still reading.
+
+#if PORT_GAME == PORT_GAME_WC2010
+// The library's own GPU-less mode (device+0x2ABD bit 0x02, also what its GPU hang recovery
+#else /* street4 copa2014 */
+// The library's own GPU-less mode (device+0x2B3D bit 0x02, also what its GPU hang recovery
+#endif /* PORT_GAME */
+// GA_D3D_HOOKS falls back to; Street 3 uses the same bit at +0x2ABD): timestamps are written by
+#if PORT_GAME == PORT_GAME_COPA2014
+// the CPU when inserted (0x8244DC5C), waits return at once (0x82451DE0), kicks skip the ring
+// and segments are no longer handed to the command-buffer worker DPCs (0x82455B34). Without
+#elif PORT_GAME == PORT_GAME_WC2010
+// the CPU when inserted (0x827321AC), waits return at once (0xa step of 0x82723220), kicks skip the ring
+// and segments are no longer handed to the command-buffer worker DPCs (0x(worker hand-off)). Without
+#else /* street4 */
+// the CPU when inserted (0x82714174), waits return at once (0x826FCC78), kicks skip the ring
+// and segments are no longer handed to the command-buffer worker DPCs (0x82719594). Without
+#endif /* PORT_GAME */
+// it, completion published here could overtake a worker still reading a segment, which then
+#if PORT_GAME == PORT_GAME_COPA2014
+// read a recycled segment (null callback at 0x8245570C) and left device+0x2B90 stuck.
+#elif PORT_GAME == PORT_GAME_WC2010
+// read a recycled segment (null worker callback) and left device+0x2B04 stuck.
+#else /* street4 */
+// read a recycled segment (null callback at 0x82719174) and left device+0x2B90 stuck.
+#endif /* PORT_GAME */
+void EnableGpulessMode(uint8_t* base, uint32_t dev) {
+#if PORT_GAME == PORT_GAME_WC2010
+  uint8_t* flags = GuestPtr(base, dev + 0x2ABD);
+#else /* street4 copa2014 */
+  uint8_t* flags = GuestPtr(base, dev + 0x2B3D);
+#endif /* PORT_GAME */
+  if (!(*flags & 0x02)) {
+    *flags |= 0x02;
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_INFO("copa: D3D library GPU-less mode enabled (device {:08X})", dev);
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_INFO("wc2010: D3D library GPU-less mode enabled (device {:08X})", dev);
+#else /* street4 */
+    REXLOG_INFO("street4: D3D library GPU-less mode enabled (device {:08X})", dev);
+#endif /* PORT_GAME */
+  }
+}
+
+void PublishCompletion(uint8_t* base, uint32_t dev) {
+  g_device = dev;
+  EnableGpulessMode(base, dev);
+  uint32_t block = LoadBE32(GuestPtr(base, dev + dev::kStatusBlock));
+#if PORT_GAME == PORT_GAME_COPA2014
+  if (!block || LoadBE32(GuestPtr(base, dev + 0x2B90)) != 0) return;
+  const uint32_t timestamp = LoadBE32(GuestPtr(base, dev + dev::kTimestamp));
+  // A CPU poll may observe completion without ever calling BlockOnFence.
+  // Publish the resolved pixels before publishing the timestamp they belong to.
+  Renderer::Get().FlushWriteBacks(timestamp);
+  StoreBE32(base, block, timestamp);
+#elif PORT_GAME == PORT_GAME_WC2010
+  if (!block || LoadBE32(GuestPtr(base, dev + 0x2B04)) != 0) return;
+  StoreBE32(base, block, LoadBE32(GuestPtr(base, dev + dev::kTimestamp)));
+#else /* street4 */
+  if (!block || LoadBE32(GuestPtr(base, dev + 0x2B90)) != 0) return;
+  StoreBE32(base, block, LoadBE32(GuestPtr(base, dev + dev::kTimestamp)));
+#endif /* PORT_GAME */
+}
+
+void PollCompletion(void*) {
+  uint32_t dev = g_device;
+  if (!dev) return;
+  uint8_t* base = rex::Runtime::instance()->memory()->virtual_membase();
+  PublishCompletion(base, dev);
+}
+
+void RegisterPoller() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    if (auto* gfx = NativeGraphicsSystem::Get()) gfx->SetCompletionPoller(PollCompletion, nullptr);
+  });
+}
+
+REX_HOOK_RAW(FN_D3D_HOOKS) {
+  StartStatsThread();
+  RegisterPoller();
+  ++g_counters.timestamps;
+  uint32_t dev = ctx.r3.u32;
+#if PORT_GAME == PORT_GAME_COPA2014
+  uint32_t position = (LoadBE32(GuestPtr(base, dev + dev::kRingPositionBits)) & 3) | LoadBE32(GuestPtr(base, dev + dev::kRingWrite));
+  __imp__sub_8244DB48(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  uint32_t position = (LoadBE32(GuestPtr(base, dev + 0x3B18)) & 3) | LoadBE32(GuestPtr(base, dev + dev::kRingWrite));
+  __imp__sub_827320F0(ctx, base);
+#else /* street4 */
+  uint32_t position = (LoadBE32(GuestPtr(base, dev + 0x3BCC)) & 3) | LoadBE32(GuestPtr(base, dev + dev::kRingWrite));
+  __imp__sub_82714060(ctx, base);
+#endif /* PORT_GAME */
+  uint32_t block = LoadBE32(GuestPtr(base, dev + dev::kStatusBlock));
+  if (block) StoreBE32(base, block + 4, position);
+  PublishCompletion(base, dev);
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_8244D1F8);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_82731880);
+#else /* street4 */
+REX_EXTERN(__imp__sub_82713710);
+#endif /* PORT_GAME */
+// BlockOnFence(device, fence, ...): already complete (see PublishCompletion). The CPU reads
+// what the GPU wrote after waiting, so queued resolve results are stored first.
+REX_HOOK_RAW(FN_D3D_HOOKS_2) {
+  Renderer::Get().FlushWriteBacks(ctx.r4.u32);
+  PublishCompletion(base, ctx.r3.u32);
+  static std::atomic<int> logged{0};
+  if (logged++ < 20) {
+    uint32_t dev = ctx.r3.u32, block = LoadBE32(GuestPtr(base, dev + dev::kStatusBlock));
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_INFO("copa BlockOnFence dev={:08X} fence={:08X} ts={:08X} status_block={:08X} done={:08X} flags={:02X}",
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_INFO("wc2010 BlockOnFence dev={:08X} fence={:08X} ts={:08X} status_block={:08X} done={:08X} flags={:02X}",
+#else /* street4 */
+    REXLOG_INFO("street4 BlockOnFence dev={:08X} fence={:08X} ts={:08X} status_block={:08X} done={:08X} flags={:02X}",
+#endif /* PORT_GAME */
+                dev, ctx.r4.u32, LoadBE32(GuestPtr(base, dev + dev::kTimestamp)), block,
+#if PORT_GAME == PORT_GAME_WC2010
+                block ? LoadBE32(GuestPtr(base, block)) : 0, *GuestPtr(base, dev + 0x2ABD));
+#else /* street4 copa2014 */
+                block ? LoadBE32(GuestPtr(base, block)) : 0, *GuestPtr(base, dev + 0x2B3D));
+#endif /* PORT_GAME */
+  }
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_8244D1F8(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_82731880(ctx, base);
+#else /* street4 */
+  __imp__sub_82713710(ctx, base);
+#endif /* PORT_GAME */
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_8244DC88);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_827322C0);
+#else /* street4 */
+REX_EXTERN(__imp__sub_827141A0);
+#endif /* PORT_GAME */
+// Requests "run function(argument) in the CP interrupt once the GPU gets here".
+REX_HOOK_RAW(FN_D3D_HOOKS_3) {
+  StartStatsThread();
+  ++g_counters.callbacks;
+  uint32_t dev = ctx.r3.u32, function = ctx.r6.u32, argument = ctx.r7.u32;
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_8244DC88(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_827322C0(ctx, base);
+#else /* street4 */
+  __imp__sub_827141A0(ctx, base);
+#endif /* PORT_GAME */
+  // GA_D3D_HOOKS_2 wakes a command-buffer worker to replay the tiled segments that EndTiling
+  // (GA_D3D_HOOKS_3) handed to it. In GPU-less mode EndTiling hands nothing over (draws were
+  // already rendered at full size), so delivering it would replay a stale segment and
+#if PORT_GAME == PORT_GAME_COPA2014
+  // drive device+0x2B90 negative.
+  if (function == 0x824549E8 && (*GuestPtr(base, dev + 0x2B3D) & 0x02)) return;
+#elif PORT_GAME == PORT_GAME_WC2010
+  // drive device+0x2B04 negative.
+  if (function == 0x827362C0 && (*GuestPtr(base, dev + 0x2ABD) & 0x02)) return;
+#else /* street4 */
+  // drive device+0x2B90 negative.
+  if (function == 0x82718450 && (*GuestPtr(base, dev + 0x2B3D) & 0x02)) return;
+#endif /* PORT_GAME */
+  if (function) {
+    uint32_t block = LoadBE32(GuestPtr(base, dev + dev::kCallbackBlock));
+    if (auto* gfx = NativeGraphicsSystem::Get()) gfx->QueueGpuCallback(block, function, argument);
+  }
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_8244D668);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_82731CE0);
+#else /* street4 */
+REX_EXTERN(__imp__sub_82713B80);
+#endif /* PORT_GAME */
+// Kicks command segments to the primary ring (writes CP_RB_WPTR into the RAM sink).
+#if PORT_GAME == PORT_GAME_WC2010
+// The 2010 library writes CP_RB_WPTR inline here (dev+0x2ACC = write index).
+#else /* street4 copa2014 */
+#endif /* PORT_GAME */
+REX_HOOK_RAW(FN_D3D_HOOKS_4) {
+  StartStatsThread();
+  ++g_counters.kicks;
+  uint32_t dev = ctx.r3.u32;
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_8244D668(ctx, base);
+  if (auto* gfx = NativeGraphicsSystem::Get()) gfx->ReportReadPointer(LoadBE32(GuestPtr(base, dev + 0x2B50)));
+}
+
+REX_EXTERN(__imp__sub_8244CE50);
+REX_HOOK_RAW(sub_8244CE50) {
+  uint32_t write_index = ctx.r4.u32;
+  __imp__sub_8244CE50(ctx, base);
+  if (auto* gfx = NativeGraphicsSystem::Get()) gfx->ReportReadPointer(write_index);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_82731CE0(ctx, base);
+  if (auto* gfx = NativeGraphicsSystem::Get()) gfx->ReportReadPointer(LoadBE32(GuestPtr(base, dev + 0x2ACC)));
+#else /* street4 */
+  __imp__sub_82713B80(ctx, base);
+  if (auto* gfx = NativeGraphicsSystem::Get()) gfx->ReportReadPointer(LoadBE32(GuestPtr(base, dev + 0x2B50)));
+}
+
+REX_EXTERN(__imp__sub_82713368);
+REX_HOOK_RAW(sub_82713368) {
+  uint32_t write_index = ctx.r4.u32;
+  __imp__sub_82713368(ctx, base);
+  if (auto* gfx = NativeGraphicsSystem::Get()) gfx->ReportReadPointer(write_index);
+#endif /* PORT_GAME */
+}
+
+// ----------------------------------------------------------------------------- shaders
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_82457498);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_82738BF8);
+#else /* street4 */
+REX_EXTERN(__imp__sub_8271AEF8);
+#endif /* PORT_GAME */
+// PatchVertexShaderInPlace(device, shader, declaration, binding) -> 0 when the GPU may still
+// read the binding (see ImmediateVertexShader in guest_device.h); else the binding in memory
+// is the loaded shader again.
+REX_HOOK_RAW(FN_D3D_HOOKS_5) {
+  uint32_t shader = ctx.r4.u32, binding = ctx.r6.u32;
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_82457498(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_82738BF8(ctx, base);
+#else /* street4 */
+  __imp__sub_8271AEF8(ctx, base);
+#endif /* PORT_GAME */
+  auto& imm = LoadedImmediateVertexShader();
+  if (ctx.r3.u32 && imm.shader == shader && imm.binding == binding) imm = {};
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_82457290);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_82738960);
+#else /* street4 */
+REX_EXTERN(__imp__sub_8271ACF0);
+#endif /* PORT_GAME */
+// LoadVertexShaderImmediate(device, patch, shader, ..., binding [r10]): copies the binding's
+// microcode behind an IM_LOAD_IMMEDIATE header into the command buffer and patches the copy;
+// the copy ends at the command buffer pointer (device+48) on return.
+REX_HOOK_RAW(FN_D3D_HOOKS_6) {
+  uint32_t dev = ctx.r3.u32, shader = ctx.r5.u32, binding = ctx.r10.u32;
+  uint32_t before = LoadBE32(GuestPtr(base, dev + 48));
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_82457290(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_82738960(ctx, base);
+#else /* street4 */
+  __imp__sub_8271ACF0(ctx, base);
+#endif /* PORT_GAME */
+  uint32_t end = LoadBE32(GuestPtr(base, dev + 48));
+#if PORT_GAME == PORT_GAME_COPA2014
+  static const bool disabled = std::getenv("COPA_NO_IMMEDIATE_VS") != nullptr;  // diagnostics
+  if (end == before || binding > 1 || !ValidGuest(shader)) return;
+  if (disabled) {
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) < 400) REXLOG_INFO("copa: vertex shader {:08X} binding {} immediate load (ignored)", shader, binding);
+    return;
+  }
+#elif PORT_GAME == PORT_GAME_WC2010
+  static const bool disabled = std::getenv("WC2010_NO_IMMEDIATE_VS") != nullptr;  // diagnostics
+  if (disabled || end == before || binding > 1 || !ValidGuest(shader)) return;
+#else /* street4 */
+  static const bool disabled = std::getenv("STREET4_NO_IMMEDIATE_VS") != nullptr;  // diagnostics
+  if (disabled || end == before || binding > 1 || !ValidGuest(shader)) return;
+#endif /* PORT_GAME */
+  uint32_t record = shader + LoadBE32(GuestPtr(base, shader + 0x380 + 8 * binding));
+  if (!ValidGuest(record)) return;
+  uint32_t size = LoadBE32(GuestPtr(base, record + 0x36C));
+  uint32_t start = end - size + 4;
+  if (!size || size > 0x10000 || (size & 3) || !ValidGuest(start)) return;
+  auto& imm = LoadedImmediateVertexShader();
+  imm.shader = shader;
+  imm.binding = binding;
+  const uint8_t* src = GuestPtr(base, start);
+  imm.code.assign(src, src + size);
+  static std::atomic<int> logs{0};
+  if (logs.fetch_add(1) < 8)
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_INFO("copa: vertex shader {:08X} binding {} loaded through the command buffer ({} bytes at {:08X})",
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_INFO("wc2010: vertex shader {:08X} binding {} loaded through the command buffer ({} bytes at {:08X})",
+#else /* street4 */
+    REXLOG_INFO("street4: vertex shader {:08X} binding {} loaded through the command buffer ({} bytes at {:08X})",
+#endif /* PORT_GAME */
+                shader, binding, size, start);
+}
+
+// ----------------------------------------------------------------------------- draws
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_8245D198);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_82733718);
+#else /* street4 */
+REX_EXTERN(__imp__sub_8271C8C8);
+#endif /* PORT_GAME */
+// DrawIndexedVertices(device, primitive, base_vertex, start_index, index_count).
+REX_HOOK_RAW(FN_D3D_HOOKS_7) {
+  StartStatsThread();
+  ++g_counters.draws;
+  FlushPending(base);
+  uint32_t dev = ctx.r3.u32;
+  DrawRequest d;
+  d.primitive = ctx.r4.u32;
+  d.base_vertex = int32_t(ctx.r5.u32);
+  uint32_t start = ctx.r6.u32;
+  d.count = ctx.r7.u32;
+  d.indexed = true;
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_8245D198(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_82733718(ctx, base);
+#else /* street4 */
+  __imp__sub_8271C8C8(ctx, base);
+#endif /* PORT_GAME */
+  uint32_t ib = LoadBE32(GuestPtr(base, dev + dev::kIndexBuffer));
+  if (!ValidGuest(ib) || !ValidGuest(LoadBE32(GuestPtr(base, ib + 0x18)))) return;
+  d.index32 = (LoadBE32(GuestPtr(base, ib)) >> 31) & 1;
+  d.index_address = LoadBE32(GuestPtr(base, ib + 0x18)) + start * (d.index32 ? 4 : 2);
+  Renderer::Get().Draw(GuestDevice(base, dev), d);
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_8245CD80);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_82733328);
+#else /* street4 */
+REX_EXTERN(__imp__sub_8271C4B0);
+#endif /* PORT_GAME */
+// DrawVertices(device, primitive, start_vertex, vertex_count).
+REX_HOOK_RAW(FN_D3D_HOOKS_8) {
+  StartStatsThread();
+  ++g_counters.draws;
+  FlushPending(base);
+  uint32_t dev = ctx.r3.u32;
+  DrawRequest d;
+  d.primitive = ctx.r4.u32;
+  d.first_vertex = 0;
+  d.base_vertex = 0;
+  uint32_t start = ctx.r5.u32;
+  d.count = ctx.r6.u32;
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_8245CD80(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_82733328(ctx, base);
+#else /* street4 */
+  __imp__sub_8271C4B0(ctx, base);
+#endif /* PORT_GAME */
+  d.first_vertex = start;
+  Renderer::Get().Draw(GuestDevice(base, dev), d);
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_8245C298);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_82732E48);
+#else /* street4 */
+REX_EXTERN(__imp__sub_8271B9C8);
+#endif /* PORT_GAME */
+// BeginVertices(device, primitive, vertex_count, stride) -> pointer the caller fills.
+// The library binds the data to vertex fetch constant 95 (group 31, dwords 4-5).
+REX_HOOK_RAW(FN_D3D_HOOKS_9) {
+  StartStatsThread();
+  ++g_counters.inline_draws;
+  FlushPending(base);
+  uint32_t dev = ctx.r3.u32, primitive = ctx.r4.u32, count = ctx.r5.u32, stride = ctx.r6.u32;
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_8245C298(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_82732E48(ctx, base);
+#else /* street4 */
+  __imp__sub_8271B9C8(ctx, base);
+#endif /* PORT_GAME */
+  uint32_t data = ctx.r3.u32;
+  if (!ValidGuest(data)) return;
+  g_pending.active = true;
+  g_pending.device = dev;
+  g_pending.draw = DrawRequest{};
+  g_pending.draw.primitive = primitive;
+  g_pending.draw.count = count;
+  g_pending.draw.vfetch_override = true;
+  g_pending.draw.override_index = 95;
+  g_pending.draw.override_address = data;
+  g_pending.draw.override_bytes = count * stride;
+  g_pending.draw.override_endian = 2;
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_8245C288);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_82732E38);
+#else /* street4 */
+REX_EXTERN(__imp__sub_8271B9B8);
+#endif /* PORT_GAME */
+// EndVertices(device).
+REX_HOOK_RAW(FN_D3D_HOOKS_10) {
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_8245C288(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_82732E38(ctx, base);
+#else /* street4 */
+  __imp__sub_8271B9B8(ctx, base);
+#endif /* PORT_GAME */
+  FlushPending(base);
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_8245C758);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_827332E0);
+#else /* street4 */
+REX_EXTERN(__imp__sub_8271BE88);
+#endif /* PORT_GAME */
+// DrawVerticesUP(device, primitive, vertex_count, data, stride): Begin + copy + inline End.
+REX_HOOK_RAW(FN_D3D_HOOKS_11) {
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_8245C758(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_827332E0(ctx, base);
+#else /* street4 */
+  __imp__sub_8271BE88(ctx, base);
+#endif /* PORT_GAME */
+  FlushPending(base);
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_8245CCE0);
+// DrawIndexedVerticesUP(device, primitive, min_index, vertex_count, index_count, indices,
+//                       index_format, vertex_data, stride[stack]).
+REX_HOOK_RAW(sub_8245CCE0) {
+  StartStatsThread();
+  ++g_counters.inline_draws;
+  FlushPending(base);
+  uint32_t dev = ctx.r3.u32;
+  DrawRequest d;
+  d.primitive = ctx.r4.u32;
+  uint32_t vertex_count = ctx.r6.u32 + ctx.r5.u32;
+  d.count = ctx.r7.u32;
+  d.index_address = ctx.r8.u32;
+  d.index32 = (ctx.r9.u32 & 4) != 0;
+  uint32_t vertex_data = ctx.r10.u32;
+  uint32_t stride = LoadBE32(GuestPtr(base, ctx.r1.u32 + 0x54));
+  d.indexed = true;
+  __imp__sub_8245CCE0(ctx, base);
+  d.vfetch_override = true;
+  d.override_index = 95;
+  d.override_address = vertex_data;
+  d.override_bytes = vertex_count * stride;
+  d.override_endian = 2;
+  Renderer::Get().Draw(GuestDevice(base, dev), d);
+}
+
+#elif PORT_GAME == PORT_GAME_WC2010
+#else /* street4 */
+REX_EXTERN(__imp__sub_8271C410);
+// DrawIndexedVerticesUP(device, primitive, min_index, vertex_count, index_count, indices,
+//                       index_format, vertex_data, stride[stack]).
+REX_HOOK_RAW(sub_8271C410) {
+  StartStatsThread();
+  ++g_counters.inline_draws;
+  FlushPending(base);
+  uint32_t dev = ctx.r3.u32;
+  DrawRequest d;
+  d.primitive = ctx.r4.u32;
+  uint32_t vertex_count = ctx.r6.u32 + ctx.r5.u32;
+  d.count = ctx.r7.u32;
+  d.index_address = ctx.r8.u32;
+  d.index32 = (ctx.r9.u32 & 4) != 0;
+  uint32_t vertex_data = ctx.r10.u32;
+  uint32_t stride = LoadBE32(GuestPtr(base, ctx.r1.u32 + 0x54));
+  d.indexed = true;
+  __imp__sub_8271C410(ctx, base);
+  d.vfetch_override = true;
+  d.override_index = 95;
+  d.override_address = vertex_data;
+  d.override_bytes = vertex_count * stride;
+  d.override_endian = 2;
+  Renderer::Get().Draw(GuestDevice(base, dev), d);
+}
+
+#endif /* PORT_GAME */
+// ----------------------------------------------------------------------------- resolve
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_82467568);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_827301B8);
+#else /* street4 */
+REX_EXTERN(__imp__sub_82713018);
+#endif /* PORT_GAME */
+// Resolve(device, flags, source_rect*, dest_texture*, dest_level, dest_point*, slice,
+//         clear_color*, clear_z(f1), clear_stencil[stack], parameters*[stack]).
+REX_HOOK_RAW(FN_D3D_HOOKS_12) {
+  StartStatsThread();
+  ++g_counters.resolves;
+  FlushPending(base);
+  uint32_t dev = ctx.r3.u32;
+  ResolveRequest r;
+  r.flags = ctx.r4.u32;
+  if (uint32_t rect = ctx.r5.u32; ValidGuest(rect)) {
+    r.src_x0 = int32_t(LoadBE32(GuestPtr(base, rect)));
+    r.src_y0 = int32_t(LoadBE32(GuestPtr(base, rect + 4)));
+    r.src_x1 = int32_t(LoadBE32(GuestPtr(base, rect + 8)));
+    r.src_y1 = int32_t(LoadBE32(GuestPtr(base, rect + 12)));
+  }
+  r.has_dest = ctx.r6.u32 != 0;
+  if (uint32_t tex = ctx.r6.u32; ValidGuest(tex)) {
+    uint32_t fetch1 = LoadBE32(GuestPtr(base, tex + 0x1C + 4));
+    uint32_t swizzle = (LoadBE32(GuestPtr(base, tex + 0x1C + 12)) >> 1) & 0xFFF;
+    r.dest_format = int32_t(fetch1 & 0x3F);
+    r.dest_endian = int32_t((fetch1 >> 6) & 3);
+    r.dest_red_blue_swap = (swizzle & 7) == 2 && ((swizzle >> 6) & 7) == 0;
+  }
+  if (uint32_t point = ctx.r8.u32; ValidGuest(point)) {
+    r.dst_x = int32_t(LoadBE32(GuestPtr(base, point)));
+    r.dst_y = int32_t(LoadBE32(GuestPtr(base, point + 4)));
+    r.has_dest_point = true;
+  }
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_82467568(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_827301B8(ctx, base);
+#else /* street4 */
+  __imp__sub_82713018(ctx, base);
+#endif /* PORT_GAME */
+  Renderer::Get().Resolve(GuestDevice(base, dev), r);
+}
+
+// ----------------------------------------------------------------------------- present
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_82453DC0);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_8272E488);
+#else /* street4 */
+REX_EXTERN(__imp__sub_8270FDC0);
+#endif /* PORT_GAME */
+// Present/Swap(device, front_buffer_texture*, ...). The texture's fetch constant is at +0x1C.
+REX_HOOK_RAW(FN_D3D_HOOKS_13) {
+  StartStatsThread();
+  ++g_counters.presents;
+  FlushPending(base);
+  uint32_t front = ctx.r4.u32;
+  uint8_t fetch[24] = {};
+  if (!ValidGuest(front)) front = 0;
+  if (front) std::memcpy(fetch, GuestPtr(base, front + 0x1C), 24);
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_82453DC0(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_8272E488(ctx, base);
+#else /* street4 */
+  __imp__sub_8270FDC0(ctx, base);
+#endif /* PORT_GAME */
+  FlushPending(base);
+  if (front) Renderer::Get().Present(fetch);
+}
+
+// ----------------------------------------------------------------------------- clears
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_82468830);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_8272DBB8);
+#else /* street4 */
+REX_EXTERN(__imp__sub_8270ED88);
+#endif /* PORT_GAME */
+// Clear(device, rect_count, rects*, flags, color(ARGB), z(f1), stencil).
+// flags: bits 0-3 render targets, 0x10 depth, 0x20 stencil.
+REX_HOOK_RAW(FN_D3D_HOOKS_14) {
+  StartStatsThread();
+  ++g_counters.clears;
+  FlushPending(base);
+  uint32_t dev = ctx.r3.u32, count = ctx.r4.u32, rects = ctx.r5.u32, flags = ctx.r6.u32;
+  uint32_t color = ctx.r7.u32, stencil = ctx.r9.u32;
+  float z = float(ctx.f1.f64);
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_82468830(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_8272DBB8(ctx, base);
+#else /* street4 */
+  __imp__sub_8270ED88(ctx, base);
+#endif /* PORT_GAME */
+  float rgba[4] = {float((color >> 16) & 0xFF) / 255.0f, float((color >> 8) & 0xFF) / 255.0f,
+                   float(color & 0xFF) / 255.0f, float(color >> 24) / 255.0f};
+  std::vector<int32_t> r;
+  if (ValidGuest(rects))
+    for (uint32_t i = 0; i < std::min<uint32_t>(count, 64) * 4; ++i)
+      r.push_back(int32_t(LoadBE32(GuestPtr(base, rects + i * 4))));
+  Renderer::Get().ClearBound(GuestDevice(base, dev), flags & 0xF, rgba, (flags & 0x10) != 0, z,
+                             (flags & 0x20) != 0, uint8_t(stencil), r.data(),
+                             uint32_t(r.size() / 4));
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_824581E8);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_8272F1C0);
+#else /* street4 */
+REX_EXTERN(__imp__sub_82710C68);
+#endif /* PORT_GAME */
+// BeginTiling(device, flags, tile_count, tile_rects*, clear_color(float4*), clear_z(f1),
+//             clear_stencil). Tiles map to one full-size host surface, so clear it once.
+REX_HOOK_RAW(FN_D3D_HOOKS_15) {
+  StartStatsThread();
+  ++g_counters.tiling;
+  FlushPending(base);
+  uint32_t dev = ctx.r3.u32, color = ctx.r7.u32, stencil = ctx.r9.u32;
+  float z = float(ctx.f1.f64);
+  if (Renderer::Get().tracing()) {
+    std::string rects;
+    for (uint32_t i = 0; i < std::min<uint32_t>(ctx.r5.u32, 8) && ValidGuest(ctx.r6.u32); ++i)
+      rects += fmt::format(" ({},{})-({},{})", LoadBE32(GuestPtr(base, ctx.r6.u32 + i * 16)),
+                           LoadBE32(GuestPtr(base, ctx.r6.u32 + i * 16 + 4)),
+                           LoadBE32(GuestPtr(base, ctx.r6.u32 + i * 16 + 8)),
+                           LoadBE32(GuestPtr(base, ctx.r6.u32 + i * 16 + 12)));
+    REXLOG_INFO("trace BeginTiling flags={:X} tiles={}{}", ctx.r4.u32, ctx.r5.u32, rects);
+  }
+  // Union of the tile rectangles ({x0, y0, x1, y1} each).
+  uint32_t tiles = ctx.r5.u32, tile_rects = ctx.r6.u32, extent_w = 0, extent_h = 0;
+  for (uint32_t i = 0; i < std::min<uint32_t>(tiles, 16) && ValidGuest(tile_rects); ++i) {
+    extent_w = std::max(extent_w, LoadBE32(GuestPtr(base, tile_rects + i * 16 + 8)));
+    extent_h = std::max(extent_h, LoadBE32(GuestPtr(base, tile_rects + i * 16 + 12)));
+  }
+  if (extent_w > 8192 || extent_h > 8192) extent_w = extent_h = 0;
+  Renderer::Get().SetTiling(extent_w && extent_h, extent_w, extent_h);
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_824581E8(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_8272F1C0(ctx, base);
+#else /* street4 */
+  __imp__sub_82710C68(ctx, base);
+#endif /* PORT_GAME */
+  if (!ValidGuest(color)) return;
+  float rgba[4];
+  for (int i = 0; i < 4; ++i) {
+    uint32_t v = LoadBE32(GuestPtr(base, color + i * 4));
+    std::memcpy(&rgba[i], &v, 4);
+  }
+  Renderer::Get().ClearBound(GuestDevice(base, dev), 1, rgba, true, z, true, uint8_t(stencil));
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_82458558);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_8272F530);
+#else /* street4 */
+REX_EXTERN(__imp__sub_82710FD8);
+#endif /* PORT_GAME */
+// EndTiling(device, flags, resolve_rect*, dest_texture*, ...): resolves through GA_D3D_HOOKS_4.
+REX_HOOK_RAW(FN_D3D_HOOKS_16) {
+  if (Renderer::Get().tracing())
+    REXLOG_INFO("trace EndTiling flags={:X} rect={:08X} dest={:08X}", ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
+  FlushPending(base);
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_82458558(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_8272F530(ctx, base);
+#else /* street4 */
+  __imp__sub_82710FD8(ctx, base);
+#endif /* PORT_GAME */
+  Renderer::Get().SetTiling(false);
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_824526F8);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_827238F8);
+#else /* street4 */
+REX_EXTERN(__imp__sub_826FD590);
+#endif /* PORT_GAME */
+// Candidate RunCommandBuffer (WAIT_REG_MEM + INDIRECT_BUFFER); diagnostics only.
+REX_HOOK_RAW(FN_D3D_HOOKS_17) {
+  static std::atomic<uint64_t> calls{0};
+  uint64_t n = ++calls;
+  if (Renderer::Get().tracing() || n <= 5)
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_INFO("trace 824526F8 #{} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} lr={:08X}", n, ctx.r3.u32,
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_INFO("trace 827238F8 #{} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} lr={:08X}", n, ctx.r3.u32,
+#else /* street4 */
+    REXLOG_INFO("trace 826FD590 #{} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} lr={:08X}", n, ctx.r3.u32,
+#endif /* PORT_GAME */
+                ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, uint32_t(ctx.lr));
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_824526F8(ctx, base);
+}
+
+// ----------------------------------------------------------------------------- queries
+REX_EXTERN(__imp__sub_82450250);
+// Occlusion query End(query): asks the GPU to write depth sample counts (8 dwords per
+// slot, 0x20 bytes, at query+0x34; slot count at query+0x1C) that the engine then polls
+// for (it waits while the 0xFFFFFEED sentinel is still there). Published immediately as
+// "visible": Total/ZPass = 0x00101000 (same value in either byte order), fails = 0.
+REX_HOOK_RAW(sub_82450250) {
+  FlushPending(base);
+  uint32_t query = ctx.r3.u32;
+  uint32_t results = ValidGuest(query) ? LoadBE32(GuestPtr(base, query + 0x34)) : 0;
+  uint32_t slots = ValidGuest(query) ? std::max<uint32_t>(LoadBE32(GuestPtr(base, query + 0x1C)), 1) : 0;
+  __imp__sub_82450250(ctx, base);
+  if (!ValidGuest(results)) return;
+  constexpr uint32_t kVisible = 0x00101000;
+  for (uint32_t i = 0; i < std::min<uint32_t>(slots, 16); ++i) {
+    uint32_t r = results + i * 0x20;
+    const uint32_t counts[8] = {kVisible, kVisible, 0, 0, kVisible, kVisible, 0, 0};
+    for (int k = 0; k < 8; ++k) StoreBE32(base, r + k * 4, counts[k]);
+  }
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_827238F8(ctx, base);
+#else /* street4 */
+  __imp__sub_826FD590(ctx, base);
+}
+
+// ----------------------------------------------------------------------------- queries
+REX_EXTERN(__imp__sub_82703B40);
+// Occlusion query End(query): asks the GPU to write depth sample counts (8 dwords per
+// slot, 0x20 bytes, at query+0x34; slot count at query+0x1C) that the engine then polls
+// for (it waits while the 0xFFFFFEED sentinel is still there). Published immediately as
+// "visible": Total/ZPass = 0x00101000 (same value in either byte order), fails = 0.
+REX_HOOK_RAW(sub_82703B40) {
+  FlushPending(base);
+  uint32_t query = ctx.r3.u32;
+  uint32_t results = ValidGuest(query) ? LoadBE32(GuestPtr(base, query + 0x34)) : 0;
+  uint32_t slots = ValidGuest(query) ? std::max<uint32_t>(LoadBE32(GuestPtr(base, query + 0x1C)), 1) : 0;
+  __imp__sub_82703B40(ctx, base);
+  if (!ValidGuest(results)) return;
+  constexpr uint32_t kVisible = 0x00101000;
+  for (uint32_t i = 0; i < std::min<uint32_t>(slots, 16); ++i) {
+    uint32_t r = results + i * 0x20;
+    const uint32_t counts[8] = {kVisible, kVisible, 0, 0, kVisible, kVisible, 0, 0};
+    for (int k = 0; k < 8; ++k) StoreBE32(base, r + k * 4, counts[k]);
+  }
+#endif /* PORT_GAME */
+}
+
+// ----------------------------------------------------------------------------- diagnostics
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_8244E098);
+// Segment kick helper: logs callers that make device+0x2B90 grow (pending worker items).
+REX_HOOK_RAW(sub_8244E098) {
+  uint32_t dev = ctx.r3.u32, lr = ctx.lr, r7 = ctx.r7.u32, r9 = ctx.r9.u32;
+  uint32_t before = LoadBE32(GuestPtr(base, dev + 0x2B90));
+  __imp__sub_8244E098(ctx, base);
+  uint32_t after = LoadBE32(GuestPtr(base, dev + 0x2B90));
+  static std::atomic<int> logged{0};
+  if (after != before && logged++ < 30)
+    REXLOG_INFO("copa 2B90 {} -> {} by 8244E098 lr={:08X} r7={} r9={}", before, after, lr, r7, r9);
+}
+
+REX_EXTERN(__imp__sub_82451D98);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_82723220);
+#else /* street4 */
+REX_EXTERN(__imp__sub_827145B0);
+// Segment kick helper: logs callers that make device+0x2B90 grow (pending worker items).
+REX_HOOK_RAW(sub_827145B0) {
+  uint32_t dev = ctx.r3.u32, lr = ctx.lr, r7 = ctx.r7.u32, r9 = ctx.r9.u32;
+  uint32_t before = LoadBE32(GuestPtr(base, dev + 0x2B90));
+  __imp__sub_827145B0(ctx, base);
+  uint32_t after = LoadBE32(GuestPtr(base, dev + 0x2B90));
+  static std::atomic<int> logged{0};
+  if (after != before && logged++ < 30)
+    REXLOG_INFO("street4 2B90 {} -> {} by 827145B0 lr={:08X} r7={} r9={}", before, after, lr, r7, r9);
+}
+
+REX_EXTERN(__imp__sub_826FCC30);
+#endif /* PORT_GAME */
+// D3D wait-loop step (hang detector). Logs which loops spin for long.
+REX_HOOK_RAW(FN_D3D_HOOKS_18) {
+  uint32_t lr = ctx.lr;
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_82451D98(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_82723220(ctx, base);
+#else /* street4 */
+  __imp__sub_826FCC30(ctx, base);
+#endif /* PORT_GAME */
+  static std::atomic<uint64_t> spins{0};
+  static std::atomic<uint32_t> last_lr{0};
+  uint64_t n = ++spins;
+  if (last_lr.exchange(lr) != lr || (n % 200000) == 0)
+#if PORT_GAME == PORT_GAME_COPA2014
+    if (n < 50 || (n % 200000) == 0) REXLOG_INFO("copa spin #{} lr={:08X}", n, lr);
+#elif PORT_GAME == PORT_GAME_WC2010
+    if (n < 50 || (n % 200000) == 0) REXLOG_INFO("wc2010 spin #{} lr={:08X}", n, lr);
+#else /* street4 */
+    if (n < 50 || (n % 200000) == 0) REXLOG_INFO("street4 spin #{} lr={:08X}", n, lr);
+#endif /* PORT_GAME */
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+REX_EXTERN(__imp__sub_82459A80);
+#elif PORT_GAME == PORT_GAME_WC2010
+REX_EXTERN(__imp__sub_82734E70);
+#else /* street4 */
+REX_EXTERN(__imp__sub_827160B0);
+#endif /* PORT_GAME */
+REX_HOOK_RAW(FN_D3D_HOOKS_19) {
+  uint32_t lr = ctx.lr;
+#if PORT_GAME == PORT_GAME_COPA2014
+  __imp__sub_82459A80(ctx, base);
+#elif PORT_GAME == PORT_GAME_WC2010
+  __imp__sub_82734E70(ctx, base);
+#else /* street4 */
+  __imp__sub_827160B0(ctx, base);
+#endif /* PORT_GAME */
+  static std::atomic<int> logged{0};
+#if PORT_GAME == PORT_GAME_COPA2014
+  if (logged++ < 20) REXLOG_INFO("copa GPU hang recovery lr={:08X} -> {}", lr, ctx.r3.u32);
+#elif PORT_GAME == PORT_GAME_WC2010
+  if (logged++ < 20) REXLOG_INFO("wc2010 GPU hang recovery lr={:08X} -> {}", lr, ctx.r3.u32);
+#else /* street4 */
+  if (logged++ < 20) REXLOG_INFO("street4 GPU hang recovery lr={:08X} -> {}", lr, ctx.r3.u32);
+#endif /* PORT_GAME */
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+
+#elif PORT_GAME == PORT_GAME_WC2010
+#else /* street4 */
+
+// Read-only exploration of effect predicates and render entry points.
+// Do not expose an effect until an active-effect capture verifies its switch.
+#define FX_PROBE(fn, label) \
+  REX_EXTERN(__imp__##fn); \
+  REX_HOOK_RAW(fn) { \
+    __imp__##fn(ctx, base); \
+    static const bool probe = std::getenv("STREET4_FX_PROBE") != nullptr; \
+    if (probe) { \
+      static std::atomic<unsigned> seen{0}; \
+      unsigned bit = ctx.r3.u32 ? 2u : 1u; \
+      if (!(seen.fetch_or(bit) & bit)) \
+        REXLOG_INFO("street4 fx predicate: {} result={} lr={:08X}", label, ctx.r3.u32, uint32_t(ctx.lr)); \
+    } \
+  }
+FX_PROBE(sub_82B5F3E0, "bloom")
+FX_PROBE(sub_82B5E7A8, "motion_blur")
+#undef FX_PROBE
+
+#define FX_RENDER_PROBE(fn, label) \
+  REX_EXTERN(__imp__##fn); \
+  REX_HOOK_RAW(fn) { \
+    static const bool probe = std::getenv("STREET4_FX_PROBE") != nullptr; \
+    static std::atomic<bool> seen{false}; \
+    if (probe && !seen.exchange(true)) REXLOG_INFO("street4 fx render entry: {}", label); \
+    __imp__##fn(ctx, base); \
+  }
+FX_RENDER_PROBE(sub_82B5FD78, "bloom")
+FX_RENDER_PROBE(sub_82B5F128, "motion_blur")
+#undef FX_RENDER_PROBE
+
+#endif /* PORT_GAME */

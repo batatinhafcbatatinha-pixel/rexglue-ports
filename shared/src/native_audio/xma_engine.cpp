@@ -1,0 +1,967 @@
+#include "port_game.h"
+#include "../platform/native_byteorder.h"
+// Native XMA decoding. See xma_engine.h.
+//
+// Bitstream layout and the decoder's buffer semantics (packets of 2048 bytes with a 32-bit header,
+// frames with a 15-bit length that may straddle packets, output in 256-byte blocks, loop points
+// with subframe precision, the 192-sample start padding FFmpeg emits) follow the XMA research in
+// Xenia's apu/xma_context (BSD); the implementation here is our own and has no register file.
+
+#include "xma_engine.h"
+#include "xma_fields.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#if PORT_GAME == PORT_GAME_STREET3
+#else /* bf2mc madagascar3 doritos */
+#include <chrono>
+#include <condition_variable>
+#endif /* PORT_GAME */
+#include <mutex>
+#if PORT_GAME == PORT_GAME_STREET3
+#elif PORT_GAME == PORT_GAME_BF2MC
+#include <string>
+#include <thread>
+#else /* madagascar3 doritos */
+#include <thread>
+#endif /* PORT_GAME */
+#include <vector>
+
+#include <rex/logging.h>
+#include <rex/system/xmemory.h>
+
+extern "C" {
+#include "libavcodec/avcodec.h"
+#include "libavutil/error.h"
+}
+
+#if PORT_GAME == PORT_GAME_STREET3
+namespace fs3audio {
+#elif PORT_GAME == PORT_GAME_BF2MC
+namespace bf2audio {
+#else /* madagascar3 doritos */
+namespace m3audio {
+#endif /* PORT_GAME */
+
+namespace {
+
+constexpr uint32_t kBytesPerPacket = 2048;
+constexpr uint32_t kBitsPerPacket = kBytesPerPacket * 8;
+constexpr uint32_t kBitsPerPacketHeader = 32;
+constexpr uint32_t kBytesPerPacketData = kBytesPerPacket - 4;
+constexpr uint32_t kBitsPerFrameHeader = 15;
+constexpr uint32_t kMaxFrameLength = 0x7FFF;
+constexpr uint32_t kMaxFrameSizeInBits = 0x4000 - kBitsPerPacketHeader;
+constexpr uint32_t kSamplesPerFrame = 512;
+constexpr uint32_t kBytesPerFrameChannel = kSamplesPerFrame * 2;
+constexpr uint32_t kOutputBlockBytes = 256;
+constexpr uint32_t kBlocksPerFrameChannel = kBytesPerFrameChannel / kOutputBlockBytes;  // 4
+// FFmpeg's xmaframes decoder outputs the bitstream's start padding instead of dropping it, so its
+// sample numbering runs this far ahead of the guest's (loop points included).
+constexpr uint32_t kDecoderStartPadding = 192;
+constexpr int kSampleRates[4] = {24000, 32000, 44100, 48000};
+
+// Big-endian bit reader over a byte buffer (n <= 32, reads byte by byte: never past `size`).
+uint32_t PeekBits(const uint8_t* buf, size_t size_bits, size_t offset, uint32_t n) {
+  uint64_t v = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    size_t bit = offset + i;
+    uint32_t b = bit < size_bits ? (buf[bit >> 3] >> (7 - (bit & 7))) & 1 : 0;
+    v = (v << 1) | b;
+  }
+  return uint32_t(v);
+}
+
+// Packet header fields.
+inline uint32_t PacketFrameCount(const uint8_t* p) { return p[0] >> 2; }  // XMA2 only
+inline uint32_t PacketFrameOffset(const uint8_t* p) {
+  return ((uint32_t(p[0] & 3) << 13) | (uint32_t(p[1]) << 5) | (p[2] >> 3)) + kBitsPerPacketHeader;
+}
+inline bool PacketIsXma2(const uint8_t* p) { return (p[2] & 7) == 1; }
+inline uint32_t PacketSkipCount(const uint8_t* p) { return p[3]; }
+
+struct PacketInfo {
+  uint32_t frame_count = 0;
+  uint32_t current_frame = 0;
+  uint32_t current_frame_size = 0;
+  bool LastFrameInPacket() const { return frame_count == 0 || current_frame == frame_count - 1; }
+};
+
+// Output ring over guest memory (offsets in bytes; read == write means empty).
+struct OutputRing {
+  uint8_t* data;
+  uint32_t capacity, read, write;
+  uint32_t free_bytes() const {
+    if (read == write) return capacity;
+    return write < read ? read - write : capacity - write + read;
+  }
+  bool empty_after_write() const { return read == write; }
+  void Write(const uint8_t* src, uint32_t n) {
+    while (n && capacity) {
+      uint32_t chunk = std::min(n, capacity - write);
+      std::memcpy(data + write, src, chunk);
+      src += chunk;
+      n -= chunk;
+      write = (write + chunk) % capacity;
+    }
+  }
+};
+
+}  // namespace
+
+struct DecoderState {
+  std::mutex lock;
+  std::atomic<bool> busy{false};
+#if PORT_GAME == PORT_GAME_STREET3
+#else /* bf2mc madagascar3 doritos */
+  std::atomic<bool> enabled{false};  // XMAEnableContext .. XMADisableContext
+#endif /* PORT_GAME */
+  bool allocated = false;
+
+  const AVCodec* codec = nullptr;
+  AVCodecContext* av = nullptr;
+  AVPacket* packet = nullptr;
+  AVFrame* frame = nullptr;
+
+  std::array<uint8_t, kBytesPerPacketData * 2> input{};
+  std::array<uint8_t, 1 + 4096 + 8> xma_frame{};
+  std::array<uint8_t, kBytesPerFrameChannel * 2> raw{};      // frame ready for output
+  std::array<uint8_t, kBytesPerFrameChannel * 2> decoded{};  // decoder output, before realignment
+  std::array<uint8_t, kBytesPerFrameChannel * 2> carry{};    // tail of the previous decoded frame
+
+  int32_t free_blocks = 0;
+  uint32_t frame_remaining_subframes = 0;
+  uint32_t loop_output_limit = 0;
+  bool loop_start_skip_pending = false;
+  bool carry_valid = false;
+  uint32_t pending_output_limit = 0;
+  uint32_t pending_start_skip = 0;
+
+#if PORT_GAME == PORT_GAME_BF2MC
+  // Diagnostics (XmaEngine::Trace / Describe): recent events, oldest overwritten.
+  struct Event {
+    const char* what;
+    uint32_t value;
+    std::chrono::steady_clock::time_point when;
+  };
+  std::mutex trace_lock;
+  std::array<Event, 32> events{};
+  uint32_t event_count = 0;
+  const char* last_pass = nullptr;
+  uint32_t last_pass_value = 0;
+
+#else /* street3 madagascar3 doritos */
+#endif /* PORT_GAME */
+  ~DecoderState() {
+    if (av) avcodec_free_context(&av);
+    if (frame) av_frame_free(&frame);
+    if (packet) av_packet_free(&packet);
+  }
+
+  void ResetCodecHistory() {
+    // A new stream must not inherit the previous one's overlap-add tail. xmaframes has no flush
+    // callback, so the codec is reopened on the next decode instead.
+    if (av) avcodec_free_context(&av);
+    raw.fill(0);
+    decoded.fill(0);
+    carry.fill(0);
+    carry_valid = false;
+    pending_output_limit = 0;
+    pending_start_skip = 0;
+    frame_remaining_subframes = 0;
+    loop_output_limit = 0;
+    loop_start_skip_pending = false;
+  }
+
+  bool EnsureCodec(uint32_t rate_id, bool stereo) {
+    int rate = kSampleRates[std::min(rate_id, 3u)];
+    int channels = stereo ? 2 : 1;
+    if (av && av->sample_rate == rate && av->channels == channels) return true;
+    if (av) {
+      avcodec_free_context(&av);
+      carry_valid = false;  // the reopened codec restarts its output
+    }
+    av = avcodec_alloc_context3(codec);
+    if (!av) return false;
+    av->sample_rate = rate;
+    av->channels = channels;
+    av->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
+    if (avcodec_open2(av, codec, nullptr) < 0) {
+      avcodec_free_context(&av);
+      return false;
+    }
+    return true;
+  }
+};
+
+namespace {
+#if PORT_GAME == PORT_GAME_STREET3
+std::atomic<uint32_t> g_kicks{0}, g_frames{0}, g_failed{0}, g_blocks{0}, g_no_output{0};
+#else /* bf2mc madagascar3 doritos */
+std::atomic<uint32_t> g_kicks{0}, g_frames{0}, g_failed{0}, g_blocks{0}, g_no_output{0}, g_peak{0};
+#endif /* PORT_GAME */
+}
+
+struct XmaEngine::Impl {
+  rex::memory::Memory* memory = nullptr;
+  uint32_t array_virtual = 0, array_physical = 0;
+  std::array<DecoderState, kContextCount> states;
+  std::mutex alloc_lock;
+
+#if PORT_GAME == PORT_GAME_STREET3
+#else /* bf2mc madagascar3 doritos */
+  // Enabled contexts are decoded continuously, as by the hardware: whenever the game frees output
+  // blocks or validates an input buffer, the next sweep picks the change up.
+  std::thread worker;
+  std::atomic<bool> running{false};
+  std::mutex wake_lock;
+  std::condition_variable wake;
+
+  void WorkerMain() {
+    while (running) {
+      for (int i = 0; i < int(kContextCount) && running; i++) {
+        DecoderState& s = states[i];
+        if (!s.enabled) continue;
+        std::unique_lock lock(s.lock, std::try_to_lock);
+        if (!lock || !s.allocated || !s.enabled) continue;
+        s.busy = true;
+        Pass(i, false);
+        s.busy = false;
+      }
+      std::unique_lock lock(wake_lock);
+      wake.wait_for(lock, std::chrono::milliseconds(2));
+    }
+  }
+
+#endif /* PORT_GAME */
+  uint8_t* Context(int index) const { return memory->TranslateVirtual(array_virtual + index * kContextSize); }
+  uint8_t* Physical(uint32_t address) const { return memory->TranslatePhysical(address); }
+
+  // --- decode pass (one "kick") ---
+#if PORT_GAME == PORT_GAME_STREET3
+  void Pass(int index) {
+#else /* bf2mc madagascar3 doritos */
+  void Pass(int index, bool kicked) {
+#endif /* PORT_GAME */
+    DecoderState& s = states[index];
+    uint8_t* guest = Context(index);
+    Ctx c;
+    c.Load(guest);
+    const Ctx initial = c;
+    if (!c[kOutValid]) {
+#if PORT_GAME == PORT_GAME_STREET3
+      g_no_output++;
+#elif PORT_GAME == PORT_GAME_BF2MC
+      if (kicked) g_no_output++;  // the sweep finds full rings all the time
+      PassOutcome(index, "pass: output not valid", c[kOutWrite]);
+#else /* madagascar3 doritos */
+      if (kicked) g_no_output++;  // the sweep finds full rings all the time
+#endif /* PORT_GAME */
+      return;
+    }
+
+    OutputRing out{Physical(c.d[kOutPtr]), c[kOutBlocks] * kOutputBlockBytes, c[kOutRead] * kOutputBlockBytes,
+                   c[kOutWrite] * kOutputBlockBytes};
+    if (out.capacity) {
+      out.read %= out.capacity;
+      out.write %= out.capacity;
+    }
+    s.free_blocks = int32_t(out.free_bytes() / kOutputBlockBytes);
+
+    // No input: only drain what is left of the current frame.
+    if ((c[kIn0Packets] | c[kIn1Packets]) == 0) {
+#if PORT_GAME == PORT_GAME_BF2MC
+      PassOutcome(index, "pass: no input packets", s.frame_remaining_subframes);
+#else /* street3 madagascar3 doritos */
+#endif /* PORT_GAME */
+      if (s.frame_remaining_subframes) {
+        Consume(s, c, out);
+        c.set(kOutWrite, out.write / kOutputBlockBytes);
+        StoreMerged(guest, c, initial);
+      }
+      return;
+    }
+
+    const int32_t minimum = int32_t(std::max(1u, c[kSubframeDecodeCount]) + c[kOutPadding]);
+#if PORT_GAME == PORT_GAME_BF2MC
+    const uint32_t write_before = out.write;
+    const char* stop = s.free_blocks >= minimum ? "pass: ring full" : "pass: free blocks below minimum";
+#else /* street3 madagascar3 doritos */
+#endif /* PORT_GAME */
+    while (s.free_blocks >= minimum) {
+      const Ctx before = c;
+      const uint32_t remaining = s.frame_remaining_subframes;
+      const int32_t free_before = s.free_blocks;
+      Decode(s, c);
+      Consume(s, c, out);
+#if PORT_GAME == PORT_GAME_BF2MC
+      if (!c.AnyInputValid()) {
+        stop = "pass: input exhausted";
+        break;
+      }
+      if (c[kErrorStatus] == 4) {
+        stop = "pass: error 4";
+        break;
+      }
+#else /* street3 madagascar3 doritos */
+      if (!c.AnyInputValid() || c[kErrorStatus] == 4) break;
+#endif /* PORT_GAME */
+      // Malformed input that neither advances the stream nor produces output must not spin.
+      if (std::memcmp(&before, &c, sizeof(c)) == 0 && remaining == s.frame_remaining_subframes &&
+          free_before == s.free_blocks) {
+#if PORT_GAME == PORT_GAME_BF2MC
+        stop = "pass: no progress";
+#else /* street3 madagascar3 doritos */
+#endif /* PORT_GAME */
+        break;
+      }
+    }
+#if PORT_GAME == PORT_GAME_BF2MC
+    PassOutcome(index, stop, (out.write + out.capacity - write_before) % std::max(1u, out.capacity));
+#else /* street3 madagascar3 doritos */
+#endif /* PORT_GAME */
+    c.set(kOutWrite, out.write / kOutputBlockBytes);
+    if (out.empty_after_write()) c.set(kOutValid, 0);  // ring full
+    StoreMerged(guest, c, initial);
+#if PORT_GAME == PORT_GAME_BF2MC
+  }
+
+  // Records a pass outcome when it differs from the previous one (passes repeat every 2 ms).
+  void PassOutcome(int index, const char* what, uint32_t value) {
+    DecoderState& s = states[index];
+    if (what == s.last_pass && (value == 0) == (s.last_pass_value == 0)) return;
+    s.last_pass = what;
+    s.last_pass_value = value;
+    AddEvent(s, what, value);
+  }
+  static void AddEvent(DecoderState& s, const char* what, uint32_t value) {
+    std::lock_guard lock(s.trace_lock);
+    s.events[s.event_count++ % s.events.size()] = {what, value, std::chrono::steady_clock::now()};
+#else /* street3 madagascar3 doritos */
+#endif /* PORT_GAME */
+  }
+
+  // Writes back what the decoder owns, keeping fields the game changed meanwhile.
+  static void StoreMerged(uint8_t* guest, const Ctx& c, const Ctx& initial) {
+    Ctx fresh;
+    fresh.Load(guest);
+    fresh.set(kLoopCount, c[kLoopCount]);
+    fresh.set(kOutWrite, c[kOutWrite]);
+    if (initial[kIn0Valid] && !c[kIn0Valid]) fresh.set(kIn0Valid, 0);
+    if (initial[kIn1Valid] && !c[kIn1Valid]) fresh.set(kIn1Valid, 0);
+    if (initial[kOutValid] && !c[kOutValid]) fresh.set(kOutValid, 0);
+    fresh.set(kInReadOffset, c[kInReadOffset]);
+    fresh.set(kErrorStatus, c[kErrorStatus]);
+    fresh.set(kCurrentBuffer, c[kCurrentBuffer]);
+    fresh.Store(guest);
+  }
+
+  static void SwapInput(Ctx& c) {
+    c.set(c.current() ? kIn1Valid : kIn0Valid, 0);
+    c.set(kCurrentBuffer, c.current() ^ 1);
+    c.set(kInReadOffset, kBitsPerPacketHeader);
+  }
+
+  static PacketInfo GetPacketInfo(const uint8_t* packet, uint32_t frame_offset) {
+    PacketInfo info;
+    const uint32_t first = PacketFrameOffset(packet);
+    if (frame_offset < first) {
+      info.current_frame = 0;
+      info.current_frame_size = first - frame_offset;
+    }
+    uint32_t pos = first;
+    while (kBitsPerPacket - std::min(pos, kBitsPerPacket) >= kBitsPerFrameHeader) {
+      uint32_t size = PeekBits(packet, kBitsPerPacket, pos, kBitsPerFrameHeader);
+      if (size == 0 || size == kMaxFrameLength) break;
+      if (pos == frame_offset) {
+        info.current_frame = info.frame_count;
+        info.current_frame_size = size;
+      }
+      info.frame_count++;
+      if (size > kBitsPerPacket - pos) break;
+      pos += size;
+      // The last bit of a frame says whether another frame follows in this packet.
+      if (PeekBits(packet, kBitsPerPacket, pos - 1, 1) == 0) break;
+    }
+    if (PacketIsXma2(packet)) {
+      uint32_t count = PacketFrameCount(packet);
+      if (count > info.frame_count) {
+        if (info.current_frame_size == 0) info.current_frame = info.frame_count;
+        info.frame_count = count;
+      }
+    }
+    return info;
+  }
+
+  const uint8_t* NextPacket(const Ctx& c, uint32_t next_index, uint32_t packet_count) const {
+    if (next_index < packet_count) return Physical(c.InputAddress(c.current())) + next_index * kBytesPerPacket;
+    uint32_t other = c.current() ^ 1;
+    if (!c.InputValid(other) || !c.InputAddress(other)) return nullptr;
+    return Physical(c.InputAddress(other));
+  }
+
+  static uint32_t NextPacketReadOffset(const uint8_t* buffer, uint32_t next_index, uint32_t packet_count) {
+    for (; next_index < packet_count; next_index++) {
+      uint32_t offset = PacketFrameOffset(buffer + next_index * kBytesPerPacket);
+      if (offset <= kMaxFrameSizeInBits) return next_index * kBitsPerPacket + offset;
+    }
+    return kBitsPerPacketHeader;
+  }
+
+#if PORT_GAME == PORT_GAME_BF2MC
+  void Swap(DecoderState& s, Ctx& c) {
+    SwapInput(c);
+    AddEvent(s, "decode: input swapped, current", c.current());
+  }
+
+#else /* street3 madagascar3 doritos */
+#endif /* PORT_GAME */
+  void Decode(DecoderState& s, Ctx& c) {
+    if (!c.AnyInputValid() || s.frame_remaining_subframes > 0) return;
+    if (!c.InputValid(c.current())) {
+#if PORT_GAME == PORT_GAME_BF2MC
+      Swap(s, c);
+#else /* street3 madagascar3 doritos */
+      SwapInput(c);
+#endif /* PORT_GAME */
+      if (!c.InputValid(c.current())) return;
+    }
+    if (!c[kOutBlocks]) return;
+
+    const uint8_t* buffer = Physical(c.InputAddress(c.current()));
+    s.input.fill(0);
+
+    bool loop_end_frame = false;
+    if (c[kLoopCount] > 0) loop_end_frame = c[kInReadOffset] == std::max(kBitsPerPacketHeader, c[kLoopEnd]);
+
+    if (c[kInReadOffset] < kBitsPerPacketHeader) c.set(kInReadOffset, kBitsPerPacketHeader);
+    const uint32_t packet_count = c.InputPackets(c.current());
+    const uint32_t read_offset = c[kInReadOffset];
+    if (read_offset >= packet_count * kBitsPerPacket) {
+      REXLOG_WARN("[native-xma] read offset {} past the input buffer ({} packets)", read_offset, packet_count);
+#if PORT_GAME == PORT_GAME_BF2MC
+      Swap(s, c);
+#else /* street3 madagascar3 doritos */
+      SwapInput(c);
+#endif /* PORT_GAME */
+      return;
+    }
+    const uint32_t packet_index = read_offset / kBitsPerPacket;
+    const uint8_t* packet = buffer + packet_index * kBytesPerPacket;
+    const uint32_t first_frame = PacketFrameOffset(packet);
+    uint32_t relative = read_offset % kBitsPerPacket;
+    if (relative < first_frame) {
+      c.set(kInReadOffset, packet_index * kBitsPerPacket + first_frame);
+      relative = first_frame;
+    }
+
+    const uint32_t skip = PacketSkipCount(packet);
+    if (skip == 0xFF) {  // no frame starts in this packet
+      uint32_t next = NextPacketReadOffset(buffer, packet_index + 1, packet_count);
+#if PORT_GAME == PORT_GAME_BF2MC
+      if (next == kBitsPerPacketHeader) Swap(s, c);
+#else /* street3 madagascar3 doritos */
+      if (next == kBitsPerPacketHeader) SwapInput(c);
+#endif /* PORT_GAME */
+      c.set(kInReadOffset, next);
+      return;
+    }
+
+    PacketInfo info = GetPacketInfo(packet, relative);
+    const uint32_t next_packet_index = packet_index + skip + 1;
+
+    // The frame's length field itself straddles the packet boundary.
+    if (info.current_frame_size == 0) {
+      const uint8_t* next = NextPacket(c, next_packet_index, packet_count);
+      if (!next) {
+#if PORT_GAME == PORT_GAME_BF2MC
+        Swap(s, c);
+#else /* street3 madagascar3 doritos */
+        SwapInput(c);
+#endif /* PORT_GAME */
+        return;
+      }
+      std::memcpy(s.input.data(), packet + 4, kBytesPerPacketData);
+      std::memcpy(s.input.data() + kBytesPerPacketData, next + 4, kBytesPerPacketData);
+      uint32_t size = PeekBits(s.input.data(), s.input.size() * 8, relative - kBitsPerPacketHeader, kBitsPerFrameHeader);
+      if (size == kMaxFrameLength) {
+        c.set(kErrorStatus, 4);
+#if PORT_GAME == PORT_GAME_BF2MC
+        AddEvent(s, "decode: error 4 at bit", c[kInReadOffset]);
+#else /* street3 madagascar3 doritos */
+#endif /* PORT_GAME */
+        return;
+      }
+      info.current_frame_size = size;
+    }
+
+    const uint32_t bits_left_in_packet = (packet_index + 1) * kBitsPerPacket - c[kInReadOffset];
+    const uint32_t bits_in_packet = std::min(bits_left_in_packet, info.current_frame_size);
+    if (bits_in_packet == 0) {
+#if PORT_GAME == PORT_GAME_BF2MC
+      Swap(s, c);
+#else /* street3 madagascar3 doritos */
+      SwapInput(c);
+#endif /* PORT_GAME */
+      return;
+    }
+    if (info.LastFrameInPacket() && bits_left_in_packet < info.current_frame_size) {
+      const uint8_t* next = NextPacket(c, next_packet_index, packet_count);
+      if (!next) {
+        c.set(kErrorStatus, 4);
+#if PORT_GAME == PORT_GAME_BF2MC
+        AddEvent(s, "decode: error 4 at bit", c[kInReadOffset]);
+#else /* street3 madagascar3 doritos */
+#endif /* PORT_GAME */
+        return;
+      }
+      std::memcpy(s.input.data() + kBytesPerPacketData, next + 4, kBytesPerPacketData);
+    }
+    std::memcpy(s.input.data(), packet + 4, kBytesPerPacketData);
+
+    // Copy the frame's bits, keeping their alignment within the first byte.
+    const uint32_t src_bit = relative - kBitsPerPacketHeader;
+    const uint32_t padding_start = src_bit & 7;
+    const uint32_t frame_bits = info.current_frame_size;
+    const uint32_t total_bits = padding_start + frame_bits;
+    const uint32_t frame_bytes = (total_bits + 7) / 8;
+    s.xma_frame.fill(0);
+    const uint32_t src_byte = src_bit >> 3;
+    const uint32_t available = uint32_t(s.input.size()) - std::min<uint32_t>(src_byte, uint32_t(s.input.size()));
+    std::memcpy(s.xma_frame.data() + 1, s.input.data() + src_byte, std::min(frame_bytes, available));
+    s.xma_frame[1] &= uint8_t(0xFF >> padding_start);
+    if (total_bits & 7) s.xma_frame[frame_bytes] &= uint8_t(0xFF << (8 - (total_bits & 7)));
+
+    s.decoded.fill(0);
+    const bool stereo = c[kStereo] != 0;
+    bool decoded = false;
+    if (s.EnsureCodec(c[kSampleRate], stereo)) {
+      s.packet->data = s.xma_frame.data();
+      s.packet->size = int(1 + frame_bytes);
+      const uint32_t padding_end = frame_bytes * 8 - total_bits;
+      s.xma_frame[0] = uint8_t(((padding_start & 7) << 5) | ((padding_end & 7) << 2));
+      if (avcodec_send_packet(s.av, s.packet) >= 0 && avcodec_receive_frame(s.av, s.frame) >= 0) {
+        ConvertFrame(s.frame, stereo, s.decoded.data());
+        decoded = true;
+        g_frames++;
+      }
+    }
+
+    if (decoded) {
+      // Realign onto the bitstream's sample numbering: this frame's samples start
+      // kDecoderStartPadding into the decoded block and end in the head of the next one.
+      const uint32_t pad_bytes = (kDecoderStartPadding * 2) << stereo;
+      const uint32_t carry_bytes = (kBytesPerFrameChannel << stereo) - pad_bytes;
+      const uint32_t output_limit = loop_end_frame ? (c[kLoopSubframeEnd] + 1) << stereo : 0;
+      const uint32_t start_skip = s.loop_start_skip_pending ? c[kLoopSubframeSkip] << stereo : 0;
+      s.loop_start_skip_pending = false;
+      if (s.carry_valid) {
+        std::memcpy(s.raw.data(), s.carry.data(), carry_bytes);
+        std::memcpy(s.raw.data() + carry_bytes, s.decoded.data(), pad_bytes);
+        s.frame_remaining_subframes = kBlocksPerFrameChannel << stereo;
+        s.loop_output_limit = s.pending_output_limit;
+        s.frame_remaining_subframes -= std::min(s.pending_start_skip, s.frame_remaining_subframes);
+      }
+      std::memcpy(s.carry.data(), s.decoded.data() + pad_bytes, carry_bytes);
+      s.carry_valid = true;
+      s.pending_output_limit = output_limit;
+      s.pending_start_skip = start_skip;
+    } else {
+      g_failed++;
+      s.carry_valid = false;  // a dropped frame breaks the adjacency of the carried tail
+    }
+
+    // Where the next frame starts.
+    if (loop_end_frame) {
+      c.set(kInReadOffset, std::max(kBitsPerPacketHeader, c[kLoopStart]));
+      s.loop_start_skip_pending = true;
+      if (c[kLoopCount] < 255) c.set(kLoopCount, c[kLoopCount] - 1);
+      return;
+    }
+    if (!info.LastFrameInPacket()) {
+      uint32_t next_frame = (c[kInReadOffset] + bits_in_packet) % kBitsPerPacket;
+      c.set(kInReadOffset, packet_index * kBitsPerPacket + next_frame);
+      return;
+    }
+    uint32_t next = NextPacketReadOffset(buffer, next_packet_index, packet_count);
+    if (next == kBitsPerPacketHeader) {
+#if PORT_GAME == PORT_GAME_BF2MC
+      Swap(s, c);
+#else /* street3 madagascar3 doritos */
+      SwapInput(c);
+#endif /* PORT_GAME */
+      if (c.AnyInputValid()) {
+        next = PacketFrameOffset(Physical(c.InputAddress(c.current())));
+        if (next > kMaxFrameSizeInBits) {
+#if PORT_GAME == PORT_GAME_BF2MC
+          Swap(s, c);
+#else /* street3 madagascar3 doritos */
+          SwapInput(c);
+#endif /* PORT_GAME */
+          return;
+        }
+      }
+    }
+    c.set(kInReadOffset, next);
+  }
+
+  static void Consume(DecoderState& s, const Ctx& c, OutputRing& out) {
+    if (!s.frame_remaining_subframes) return;
+    const bool stereo = c[kStereo] != 0;
+    const uint32_t total = kBlocksPerFrameChannel << stereo;
+    const uint32_t consumed = total - s.frame_remaining_subframes;
+    if (s.loop_output_limit > 0 && consumed >= s.loop_output_limit) {
+      s.free_blocks -= int32_t(c[kOutPadding]);
+      s.frame_remaining_subframes = 0;
+      s.loop_output_limit = 0;
+      return;
+    }
+    uint32_t to_write = std::min(s.frame_remaining_subframes, std::max(1u, c[kSubframeDecodeCount]));
+    if (s.loop_output_limit > 0) to_write = std::min(to_write, s.loop_output_limit - consumed);
+    out.Write(s.raw.data() + kOutputBlockBytes * consumed, to_write * kOutputBlockBytes);
+    g_blocks += to_write;
+    const uint32_t headroom = s.frame_remaining_subframes == to_write ? c[kOutPadding] : 0;
+    s.free_blocks -= int32_t(to_write + headroom);
+    s.frame_remaining_subframes -= to_write;
+  }
+
+  // Planar float -> interleaved big-endian 16-bit PCM (saturated: FFmpeg can exceed [-1, 1]).
+  static void ConvertFrame(const AVFrame* frame, bool stereo, uint8_t* out) {
+    auto* o = reinterpret_cast<uint16_t*>(out);
+    const auto* l = reinterpret_cast<const float*>(frame->data[0]);
+    const auto* r = stereo ? reinterpret_cast<const float*>(frame->data[1]) : nullptr;
+    uint32_t n = std::min<uint32_t>(kSamplesPerFrame, uint32_t(std::max(frame->nb_samples, 0)));
+    auto pcm = [](float v) {
+      v = std::clamp(v, -1.0f, 1.0f) * 32767.0f;
+      return native_host::ByteSwap16(uint16_t(int16_t(std::lrintf(v))));
+    };
+#if PORT_GAME == PORT_GAME_STREET3
+#else /* bf2mc madagascar3 doritos */
+    float peak = 0.0f;
+    for (uint32_t i = 0; i < n; i++) peak = std::max({peak, std::fabs(l[i]), r ? std::fabs(r[i]) : 0.0f});
+    uint32_t p = uint32_t(std::min(peak, 1.0f) * 32767.0f), prev = g_peak.load();
+    while (p > prev && !g_peak.compare_exchange_weak(prev, p)) {
+    }
+#endif /* PORT_GAME */
+    for (uint32_t i = 0; i < n; i++) {
+      if (stereo) {
+        o[i * 2] = pcm(l[i]);
+        o[i * 2 + 1] = pcm(r[i]);
+      } else {
+        o[i] = pcm(l[i]);
+      }
+    }
+  }
+};
+
+XmaEngine& XmaEngine::Get() {
+  static XmaEngine engine;
+  return engine;
+}
+
+XmaEngine::XmaEngine() : impl_(std::make_unique<Impl>()) {}
+XmaEngine::~XmaEngine() = default;
+
+bool XmaEngine::Initialize(rex::memory::Memory* memory) {
+  if (impl_->memory) return true;
+  const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_XMAFRAMES);
+  if (!codec) {
+    REXLOG_ERROR("[native-xma] FFmpeg has no xmaframes decoder");
+    return false;
+  }
+  // The decoder reads contexts by physical address and the XDK computes indices from it, so the
+  // array lives in physical memory like the hardware's.
+  uint32_t array = memory->SystemHeapAlloc(kContextCount * kContextSize, 256, rex::memory::kSystemHeapPhysical);
+  if (!array) {
+    REXLOG_ERROR("[native-xma] unable to allocate the context array");
+    return false;
+  }
+  std::memset(memory->TranslateVirtual(array), 0, kContextCount * kContextSize);
+  impl_->memory = memory;
+  impl_->array_virtual = array;
+  impl_->array_physical = memory->GetPhysicalAddress(array);
+  for (auto& s : impl_->states) {
+    s.codec = codec;
+    s.packet = av_packet_alloc();
+    s.frame = av_frame_alloc();
+#if PORT_GAME == PORT_GAME_STREET3 || PORT_GAME == PORT_GAME_BF2MC
+    if (!s.packet || !s.frame) return false;
+#else /* madagascar3 doritos */
+    if (!s.packet || !s.frame) {
+      Shutdown();
+      return false;
+    }
+#endif /* PORT_GAME */
+  }
+#if PORT_GAME == PORT_GAME_STREET3
+#else /* bf2mc madagascar3 doritos */
+  impl_->running = true;
+  impl_->worker = std::thread([impl = impl_.get()] { impl->WorkerMain(); });
+#endif /* PORT_GAME */
+  REXLOG_INFO("[native-xma] {} decoder contexts at {:08X} (physical {:08X})", kContextCount, array,
+              impl_->array_physical);
+  return true;
+}
+
+void XmaEngine::Shutdown() {
+  if (!impl_->memory) return;
+#if PORT_GAME == PORT_GAME_STREET3
+#else /* bf2mc madagascar3 doritos */
+  if (impl_->worker.joinable()) {
+    impl_->running = false;
+    impl_->wake.notify_all();
+    impl_->worker.join();
+  }
+#endif /* PORT_GAME */
+  for (auto& s : impl_->states) {
+    std::lock_guard lock(s.lock);
+#if PORT_GAME == PORT_GAME_STREET3 || PORT_GAME == PORT_GAME_BF2MC
+#else /* madagascar3 doritos */
+    s.enabled = false;
+#endif /* PORT_GAME */
+    s.allocated = false;
+    s.ResetCodecHistory();
+#if PORT_GAME == PORT_GAME_STREET3 || PORT_GAME == PORT_GAME_BF2MC
+#else /* madagascar3 doritos */
+    av_packet_free(&s.packet);
+    av_frame_free(&s.frame);
+    s.codec = nullptr;
+#endif /* PORT_GAME */
+  }
+#if PORT_GAME == PORT_GAME_STREET3 || PORT_GAME == PORT_GAME_BF2MC
+#else /* madagascar3 doritos */
+  impl_->memory->SystemHeapFree(impl_->array_virtual);
+  impl_->array_virtual = impl_->array_physical = 0;
+  impl_->memory = nullptr;
+#endif /* PORT_GAME */
+}
+
+bool XmaEngine::ready() const { return impl_->memory != nullptr; }
+uint32_t XmaEngine::array_physical() const { return impl_->array_physical; }
+
+uint32_t XmaEngine::Allocate() {
+  if (!ready()) return 0;
+  std::lock_guard alloc(impl_->alloc_lock);
+  for (int i = 0; i < int(kContextCount); i++) {
+    DecoderState& s = impl_->states[i];
+    std::lock_guard lock(s.lock);
+    if (s.allocated) continue;
+    s.allocated = true;
+    s.ResetCodecHistory();
+    std::memset(impl_->Context(i), 0, kContextSize);
+    return impl_->array_virtual + i * kContextSize;
+  }
+  REXLOG_ERROR("[native-xma] out of decoder contexts");
+  return 0;
+}
+
+void XmaEngine::Release(uint32_t context) {
+  int i = IndexOf(context);
+  if (i < 0) return;
+  std::lock_guard alloc(impl_->alloc_lock);
+  DecoderState& s = impl_->states[i];
+#if PORT_GAME == PORT_GAME_STREET3
+#else /* bf2mc madagascar3 doritos */
+  s.enabled = false;
+#endif /* PORT_GAME */
+  std::lock_guard lock(s.lock);
+  s.allocated = false;
+  s.ResetCodecHistory();
+  std::memset(impl_->Context(i), 0, kContextSize);
+}
+
+int XmaEngine::IndexOf(uint32_t address) const {
+  if (!ready()) return -1;
+  uint32_t a = address;
+  if (a >= impl_->array_virtual && a < impl_->array_virtual + kContextCount * kContextSize) {
+    a -= impl_->array_virtual;
+  } else {
+    a = impl_->memory->GetPhysicalAddress(address);
+    if (a < impl_->array_physical || a >= impl_->array_physical + kContextCount * kContextSize) return -1;
+    a -= impl_->array_physical;
+  }
+  return int(a / kContextSize);
+}
+
+uint32_t XmaEngine::ContextAddress(int index) const { return impl_->array_virtual + index * kContextSize; }
+uint8_t* XmaEngine::ContextMemory(int index) const { return impl_->Context(index); }
+
+void XmaEngine::Kick(int index) {
+  if (index < 0 || index >= int(kContextCount)) return;
+  DecoderState& s = impl_->states[index];
+  std::lock_guard lock(s.lock);
+  if (!s.allocated) return;
+#if PORT_GAME == PORT_GAME_STREET3
+#else /* bf2mc madagascar3 doritos */
+  s.enabled = true;
+#endif /* PORT_GAME */
+  s.busy = true;
+  g_kicks++;
+#if PORT_GAME == PORT_GAME_STREET3
+  impl_->Pass(index);
+#else /* bf2mc madagascar3 doritos */
+  impl_->Pass(index, true);
+#endif /* PORT_GAME */
+  s.busy = false;
+#if PORT_GAME == PORT_GAME_STREET3
+#else /* bf2mc madagascar3 doritos */
+}
+
+bool XmaEngine::Disable(int index, bool wait) {
+  if (index < 0 || index >= int(kContextCount)) return true;
+  impl_->states[index].enabled = false;
+  return Lock(index, wait);
+#endif /* PORT_GAME */
+}
+
+bool XmaEngine::Lock(int index, bool wait) {
+  if (index < 0 || index >= int(kContextCount)) return true;
+  DecoderState& s = impl_->states[index];
+  if (!wait) {
+    if (!s.lock.try_lock()) return false;
+    s.lock.unlock();
+    return true;
+  }
+  std::lock_guard lock(s.lock);
+  return true;
+}
+
+void XmaEngine::Clear(int index) {
+  if (index < 0 || index >= int(kContextCount)) return;
+  DecoderState& s = impl_->states[index];
+  std::lock_guard lock(s.lock);
+  uint8_t* guest = impl_->Context(index);
+  Ctx c;
+  c.Load(guest);
+  c.set(kIn0Valid, 0);
+  c.set(kIn1Valid, 0);
+  c.set(kOutValid, 0);
+  c.set(kInReadOffset, kBitsPerPacketHeader);
+  c.set(kOutRead, 0);
+  c.set(kOutWrite, 0);
+  c.Store(guest);
+  s.ResetCodecHistory();
+}
+
+#if PORT_GAME == PORT_GAME_BF2MC
+void XmaEngine::Trace(int index, const char* what, uint32_t value) {
+  if (index < 0 || index >= int(kContextCount)) return;
+  Impl::AddEvent(impl_->states[index], what, value);
+}
+
+std::string XmaEngine::Describe(int index) {
+  if (index < 0 || index >= int(kContextCount)) return "no context";
+  DecoderState& s = impl_->states[index];
+  Ctx c;
+  c.Load(impl_->Context(index));
+  std::string r;
+  char line[256];
+  snprintf(line, sizeof(line),
+           "ctx %d: enabled %d allocated %d busy %d | in0 %08X x%u valid %u | in1 %08X x%u valid %u | current %u "
+           "read bit %u | out %08X blocks %u read %u write %u valid %u | subframes %u padding %u stereo %u rate %u | "
+           "loop %u..%u count %u | error %u | frame left %u carry %d free %d\n",
+           index, int(s.enabled.load()), int(s.allocated), int(s.busy.load()), c.d[kIn0Ptr], c[kIn0Packets],
+           c[kIn0Valid], c.d[kIn1Ptr], c[kIn1Packets], c[kIn1Valid], c.current(), c[kInReadOffset], c.d[kOutPtr],
+           c[kOutBlocks], c[kOutRead], c[kOutWrite], c[kOutValid], c[kSubframeDecodeCount], c[kOutPadding],
+           c[kStereo], c[kSampleRate], c[kLoopStart], c[kLoopEnd], c[kLoopCount], c[kErrorStatus],
+           s.frame_remaining_subframes, int(s.carry_valid), s.free_blocks);
+  r += line;
+  std::lock_guard lock(s.trace_lock);
+  const auto now = std::chrono::steady_clock::now();
+  uint32_t n = std::min<uint32_t>(s.event_count, uint32_t(s.events.size()));
+  for (uint32_t i = 0; i < n; i++) {
+    const auto& e = s.events[(s.event_count - n + i) % s.events.size()];
+    snprintf(line, sizeof(line), "  -%7.1f ms %s %u\n",
+             std::chrono::duration<double, std::milli>(now - e.when).count(), e.what, e.value);
+    r += line;
+  }
+  return r;
+}
+
+// FFmpeg delivers each frame kDecoderStartPadding samples late, so Decode emits frame k only once
+// frame k+1 is decoded (carry + head of the next block). The hardware has no such delay: when a
+// stream's input runs out, everything it contained is in the output ring. The game relies on that -
+// its streaming mixer (sub_820E9968) busy-waits until the ring holds all the samples the stream
+// header promised, and only feeds input after that wait - so the held-back last frame deadlocked
+// it: the audio thread spun forever, its command stream overflowed into the heap and the main
+// thread crashed later. When the game is found waiting with no input left, the held frame is
+// released, its missing tail (the delayed samples that would follow) as silence.
+uint32_t XmaEngine::ReleaseHeldFrame(int index) {
+  if (index < 0 || index >= int(kContextCount)) return 0;
+  DecoderState& s = impl_->states[index];
+  std::lock_guard lock(s.lock);
+  if (!s.allocated) return 0;
+  uint8_t* guest = impl_->Context(index);
+  Ctx c;
+  c.Load(guest);
+  const Ctx initial = c;
+  if (!c[kOutValid] || c.AnyInputValid() || s.frame_remaining_subframes || !c[kOutBlocks]) return 0;
+  const bool stereo = c[kStereo] != 0;
+  const uint32_t frame_bytes = kBytesPerFrameChannel << stereo;
+  const uint32_t pad_bytes = (kDecoderStartPadding * 2) << stereo;
+  s.raw.fill(0);
+  if (s.carry_valid) std::memcpy(s.raw.data(), s.carry.data(), frame_bytes - pad_bytes);
+  s.carry_valid = false;
+  s.frame_remaining_subframes = kBlocksPerFrameChannel << stereo;
+  s.loop_output_limit = 0;
+  OutputRing out{impl_->Physical(c.d[kOutPtr]), c[kOutBlocks] * kOutputBlockBytes, c[kOutRead] * kOutputBlockBytes,
+                 c[kOutWrite] * kOutputBlockBytes};
+  out.read %= out.capacity;
+  out.write %= out.capacity;
+  s.free_blocks = int32_t(out.free_bytes() / kOutputBlockBytes);
+  const uint32_t write_before = out.write;
+  const int32_t minimum = int32_t(std::max(1u, c[kSubframeDecodeCount]) + c[kOutPadding]);
+  while (s.frame_remaining_subframes && s.free_blocks >= minimum) {
+    const uint32_t left = s.frame_remaining_subframes;
+    Impl::Consume(s, c, out);
+    if (left == s.frame_remaining_subframes) break;
+  }
+  s.frame_remaining_subframes = 0;  // whatever did not fit is dropped: it is past the stream's end
+  c.set(kOutWrite, out.write / kOutputBlockBytes);
+  if (out.empty_after_write()) c.set(kOutValid, 0);
+  Impl::StoreMerged(guest, c, initial);
+  const uint32_t blocks = ((out.write + out.capacity - write_before) % out.capacity) / kOutputBlockBytes;
+  Impl::AddEvent(s, "released held frame, blocks", blocks);
+  return blocks;
+}
+
+#else /* street3 madagascar3 doritos */
+#endif /* PORT_GAME */
+XmaEngine::Stats XmaEngine::TakeStats() {
+  Stats st;
+  st.kicks = g_kicks.exchange(0);
+  st.frames = g_frames.exchange(0);
+  st.failed = g_failed.exchange(0);
+  st.blocks = g_blocks.exchange(0);
+  st.no_output = g_no_output.exchange(0);
+#if PORT_GAME == PORT_GAME_STREET3
+#else /* bf2mc madagascar3 doritos */
+  st.peak = g_peak.exchange(0);
+#endif /* PORT_GAME */
+  return st;
+}
+
+bool XmaEngine::Busy(int index) const {
+  if (index < 0 || index >= int(kContextCount)) return false;
+  return impl_->states[index].busy.load();
+}
+
+XmaEngine::Guard XmaEngine::LockContext(int index) {
+  impl_->states[index].lock.lock();
+  return Guard{impl_.get(), index};
+}
+
+XmaEngine::Guard::~Guard() {
+  if (impl) impl->states[index].lock.unlock();
+}
+
+#if PORT_GAME == PORT_GAME_STREET3
+}  // namespace fs3audio
+#elif PORT_GAME == PORT_GAME_BF2MC
+}  // namespace bf2audio
+#else /* madagascar3 doritos */
+}  // namespace m3audio
+#endif /* PORT_GAME */

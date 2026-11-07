@@ -1,0 +1,11 @@
+# Never published: game files, generated code, builds, logs, local tools.
+/.local/
+/_generated_*/
+games/*/game_files
+games/*/analysis
+games/*/third_party
+games/*/project/third_party
+games/*/project/generated
+games/*/project/assets
+**/__pycache__/
+*.pyc

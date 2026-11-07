@@ -1,0 +1,81 @@
+{
+  "repo": "bf2-modern-combat-pc",
+  "game": "Battlefield 2: Modern Combat",
+  "revision": "Xbox 360, USA",
+  "required_files": {
+    "default.xex": "a2e791b578ef15420f3737b48999ca4285fdf85c85cb6732aac0e465ed9d5484"
+  },
+  "required_paths": [
+    "Audio",
+    "Data1.viv"
+  ],
+  "project_dir": "project",
+  "manifest": "bf2mc_manifest.toml",
+  "target": "bf2mc",
+  "extra_targets": [],
+  "copy": [
+    "project"
+  ],
+  "ffmpeg_dest": "project/third_party/ffmpeg/include",
+  "play_args": [
+    "--mnk_mode=true",
+    "--mnk_mouse=false",
+    "--keybind_lstick_up=W,Shift+W,Ctrl+W,Shift+Ctrl+W",
+    "--keybind_lstick_down=S,Shift+S,Ctrl+S,Shift+Ctrl+S",
+    "--keybind_lstick_left=A,Shift+A,Ctrl+A,Shift+Ctrl+A",
+    "--keybind_lstick_right=D,Shift+D,Ctrl+D,Shift+Ctrl+D",
+    "--keybind_right_trigger=LMB,Shift+LMB,Ctrl+LMB,Shift+Ctrl+LMB",
+    "--keybind_left_trigger=RMB,Shift+RMB,Ctrl+RMB,Shift+Ctrl+RMB",
+    "--keybind_a=Space,Shift+Space,Ctrl+Space,Shift+Ctrl+Space",
+    "--keybind_b=C,Ctrl+C,Shift+C,Backspace",
+    "--keybind_x=R,Shift+R,Ctrl+R,Shift+Ctrl+R",
+    "--keybind_y=E,Shift+E,Ctrl+E,Shift+Ctrl+E",
+    "--keybind_left_shoulder=Q,Shift+Q,Ctrl+Q,Shift+Ctrl+Q",
+    "--keybind_right_shoulder=F,Shift+F,Ctrl+F,Shift+Ctrl+F",
+    "--keybind_lstick_press=F24",
+    "--keybind_rstick_press=V,Shift+V,Ctrl+V,Shift+Ctrl+V",
+    "--keybind_rstick_up=F24",
+    "--keybind_rstick_down=F24",
+    "--keybind_rstick_left=F24",
+    "--keybind_rstick_right=F24",
+    "--keybind_dpad_up=Up",
+    "--keybind_dpad_down=Down",
+    "--keybind_dpad_left=Left",
+    "--keybind_dpad_right=Right",
+    "--keybind_start=Return,Escape",
+    "--keybind_back=Tab"
+  ],
+  "sdk": {
+    "version": "0.10.0.24-dev.gbd833a2 (nightly 2026-10-02)",
+    "url": "https://github.com/rexglue/rexglue-sdk/releases/download/nightly-20261002-bd833a2a/rexglue-sdk-0.10.0.24-dev.gbd833a2-win-amd64.zip",
+    "sha256": "1e19d7ec9be0d9d7e1a0088a34a33b068d4dea520181e81318528ef3b37627e7",
+    "folder": "win-amd64",
+    "patches": [
+      {
+        "name": "rexglue-fpscr-mask",
+        "file": "include/rex/ppc/context.h",
+        "old": "  inline void setcsr(uint32_t csr) noexcept { Platform::setcsr(csr); }\n",
+        "new": "  // Port patch: never let a stale/zero cached csr unmask host FP exceptions\n  // (guest threads whose csr was never seeded hit STATUS_FLOAT_INEXACT_RESULT).\n  inline void setcsr(uint32_t value) noexcept {\n    Platform::InitHostExceptions(value);\n    csr = value;\n    Platform::setcsr(value);\n  }\n"
+      }
+    ]
+  },
+  "sdk_linux": {
+    "url": "https://github.com/rexglue/rexglue-sdk/releases/download/nightly-20261002-bd833a2a/rexglue-sdk-0.10.0.24-dev.gbd833a2-linux-amd64.zip",
+    "sha256": "0a56565221a4e75f91fc71f787d9299a0d0298127b970c8a88a292f8d3a3befe",
+    "folder": "linux-amd64"
+  },
+  "sdk_mac": {
+    "url": "https://github.com/rexglue/rexglue-sdk/releases/download/nightly-20261002-bd833a2a/rexglue-sdk-0.10.0.24-dev.gbd833a2-mac-amd64.zip",
+    "sha256": "17bdcebef6083b0cf01fede41fa5603d2d4c5f3049f675a02f20daa3532bc2a3",
+    "folder": "mac-amd64"
+  },
+  "ffmpeg": {
+    "commit": "0604b464c7cb4ebc94940cf1f324a3b26b87717c",
+    "url": "https://codeload.github.com/wmarti/FFmpeg/tar.gz/0604b464c7cb4ebc94940cf1f324a3b26b87717c"
+  },
+  "dxvk": {
+    "version": "3.1.1",
+    "url": "https://github.com/doitsujin/dxvk/releases/download/v3.1.1/dxvk-3.1.1.tar.gz",
+    "sha256": "40565b4a724aadc4433fa4e010b4b23916d9b1f1baeee64e17186db94f54e608"
+  }
+}

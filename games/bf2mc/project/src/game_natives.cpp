@@ -1,0 +1,635 @@
+// Native replacements for hot translated game functions, with the translated code's results.
+//
+// sub_82349150 writes particle vertices (~14% of the render thread in a mission): batches of at
+// most 4000 particles between the vertex writer's begin (sub_8233F140) and end (sub_8233F778);
+// per particle a 24-byte record {x, y, z, u, v, alpha} becomes position, UV and a packed colour
+// (alpha truncated to an integer, low byte on top of a fixed RGB). The scaffolding (singletons,
+// stack descriptor, begin/end calls) is reproduced with the same guest stack frame; the
+// per-particle loop is native.
+// sub_824AD0A8 normalises a vec3 (dst r3, src r4; zero below an epsilon), ~14% of a worker thread.
+// Vector ops use the translated code's operations, order and flush mode.
+// sub_82478728 stores shader constants into the device (r3, first r4, source r5, count r6) and
+// marks them dirty, sub_82341E68 finds an effect parameter by name (linear strcmp over 140-byte
+// entries); ~5% of the render thread together.
+// sub_824F4770 commits an effect's dirty parameters to the device (5.6% of the render thread):
+// two groups of parameters, each with float, int, bool and sampler lists for both shader stages.
+// The float copies are native; int, bool and sampler values still reach the device through the
+// translated setters, with the same guest stack frame. Not run yet: BF2_NO_NATIVE_COMMIT=1 goes
+// back to the translated function, and so does BF2_NATIVE_CHECK=1, which has no check for it.
+//
+// BF2_NO_NATIVE_PARTICLES=1 / BF2_NO_NATIVE_NORMALIZE=1 / BF2_NO_NATIVE_CONSTANTS=1 /
+// BF2_NO_NATIVE_PARAM=1 / BF2_NO_NATIVE_COMMIT=1   translated code only
+// BF2_NATIVE_CHECK=1   particles: the translated function runs and every batch it wrote is
+//                      compared with the native computation; normalize: both run on the same
+//                      input and the outputs are compared ("[native-check] ... MISMATCH")
+// BF2_NATIVE_AB=1      alternate native/translated every 600 presented frames and log
+//                      "[native-ab]" with frame time and the calling thread's CPU time
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif
+
+#include <rex/hook.h>
+#include <rex/logging.h>
+#include <rex/ppc/context.h>
+#include <rex/ppc/intrinsics.h>
+
+REX_EXTERN(__imp__sub_82349150);
+REX_EXTERN(__imp__sub_824AD0A8);
+REX_EXTERN(__imp__sub_82478728);
+REX_EXTERN(__imp__sub_82341E68);
+REX_EXTERN(__imp__sub_824F4770);
+REX_EXTERN(sub_82478A68);  // device: set int constants, vertex stage
+REX_EXTERN(sub_82478AB8);  // device: set int constants, pixel stage
+REX_EXTERN(sub_824789B8);  // device: set bool constants, vertex stage
+REX_EXTERN(sub_82478A10);  // device: set bool constants, pixel stage
+REX_EXTERN(sub_82476EF8);  // device: set texture
+REX_EXTERN(__imp__sub_8233F140);
+REX_EXTERN(__imp__sub_8233F778);
+REX_EXTERN(sub_8233F0D8);  // vertex writer singleton
+REX_EXTERN(sub_823486E0);  // particle list singleton
+REX_EXTERN(sub_8233D9F0);  // batch descriptor constructor
+REX_EXTERN(sub_8233DA50);  // batch descriptor destructor
+REX_EXTERN(sub_8233F140);  // begin(writer, 2, descriptor, count, 9, 0, matrix, arg)
+REX_EXTERN(sub_8233F778);  // end(writer, descriptor)
+
+namespace bf2_natives {
+namespace {
+bool EnvSet(const char* name) {
+  const char* v = std::getenv(name);
+  return v && *v && *v != '0';
+}
+const bool g_particles_enabled = !EnvSet("BF2_NO_NATIVE_PARTICLES");
+const bool g_normalize_enabled = !EnvSet("BF2_NO_NATIVE_NORMALIZE");
+const bool g_constants_enabled = !EnvSet("BF2_NO_NATIVE_CONSTANTS");
+const bool g_param_enabled = !EnvSet("BF2_NO_NATIVE_PARAM");
+const bool g_commit_enabled = !EnvSet("BF2_NO_NATIVE_COMMIT");
+const bool g_check = EnvSet("BF2_NATIVE_CHECK");
+const bool g_ab = EnvSet("BF2_NATIVE_AB");
+std::atomic<bool> g_ab_on{true};
+std::atomic<uint64_t> g_particle_batches{0}, g_particle_mismatches{0};
+std::atomic<uint64_t> g_normalize_calls{0}, g_normalize_mismatches{0};
+std::atomic<uint64_t> g_constant_calls{0}, g_constant_mismatches{0};
+std::atomic<uint64_t> g_param_calls{0}, g_param_mismatches{0};
+
+double ThreadCpuMs() {
+#ifdef _WIN32
+  FILETIME c, e, k, u;
+  if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0;
+  auto ms = [](FILETIME f) { return double((uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime) / 1e4; };
+  return ms(k) + ms(u);
+#else
+  timespec ts{};
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+  return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+#endif
+}
+}  // namespace
+
+bool NativeOn() { return !g_ab || g_ab_on.load(std::memory_order_relaxed); }
+
+// Called once per presented frame (gpu_hooks.cpp, Swap).
+void FrameTick() {
+  if (!g_ab) return;
+  static uint64_t frames = 0;
+  static auto start = std::chrono::steady_clock::now();
+  static double cpu_start = ThreadCpuMs();
+  if (++frames % 600 != 0) return;
+  auto now = std::chrono::steady_clock::now();
+  double ms = std::chrono::duration<double, std::milli>(now - start).count();
+  double cpu = ThreadCpuMs();
+  start = now;
+  bool was = g_ab_on.load(std::memory_order_relaxed);
+  REXLOG_INFO("[native-ab] native={} frames=600 ms={:.1f} fps={:.2f} thread_cpu_ms/frame={:.3f}", was ? 1 : 0, ms,
+              600000.0 / ms, (cpu - cpu_start) / 600.0);
+  cpu_start = cpu;
+  g_ab_on.store(!was, std::memory_order_relaxed);
+}
+}  // namespace bf2_natives
+
+namespace {
+using namespace bf2_natives;
+using V = simde__m128i;
+using F = simde__m128;
+
+uint8_t* Host(uint8_t* base, uint32_t a) { return base + a + (a >= 0xE0000000u ? 0x1000u : 0u); }
+uint32_t Load32(uint8_t* base, uint32_t a) {
+  uint32_t v;
+  std::memcpy(&v, Host(base, a), 4);
+  return __builtin_bswap32(v);
+}
+void Store32(uint8_t* base, uint32_t a, uint32_t v) {
+  v = __builtin_bswap32(v);
+  std::memcpy(Host(base, a), &v, 4);
+}
+uint64_t Load64(uint8_t* base, uint32_t a) {
+  uint64_t v;
+  std::memcpy(&v, Host(base, a), 8);
+  return __builtin_bswap64(v);
+}
+void Store64(uint8_t* base, uint32_t a, uint64_t v) {
+  v = __builtin_bswap64(v);
+  std::memcpy(Host(base, a), &v, 8);
+}
+V Rev(V v) { return simde_mm_shuffle_epi8(v, simde_mm_loadu_si128(reinterpret_cast<const V*>(rex::ppc::VectorMaskL))); }
+V LoadA(uint8_t* base, uint32_t a) { return Rev(simde_mm_load_si128(reinterpret_cast<const V*>(Host(base, a & ~0xFu)))); }
+void StoreA(uint8_t* base, uint32_t a, V v) { simde_mm_store_si128(reinterpret_cast<V*>(Host(base, a & ~0xFu)), Rev(v)); }
+F AsF(V v) { return simde_mm_castsi128_ps(v); }
+V AsV(F f) { return simde_mm_castps_si128(f); }
+
+// ---------------------------------------------------------------------------------- particles
+constexpr uint32_t kParticleRgb = 0x828164C5;   // 3 bytes: R, G, B
+constexpr uint32_t kZero = 0x8209890C;          // float written into the descriptor (+0xA0..+0xA8)
+
+// fctidz of a float alpha, low 32 bits (stfiwx).
+uint32_t AlphaWord(uint32_t bits) {
+  float f;
+  std::memcpy(&f, &bits, 4);
+  double d = double(f);
+  int64_t i = std::isnan(d) ? int64_t(0x8000000000000000ULL)
+              : (d > double(LLONG_MAX)) ? LLONG_MAX
+                                         : simde_mm_cvttsd_si64(simde_mm_load_sd(&d));
+  return uint32_t(i);
+}
+
+// The per-particle loop of 0x823492B0: `count` records from `src`, vertex writer `writer`.
+// `stack_word` receives the last alpha word (the original keeps it at r1+80).
+void WriteParticles(uint8_t* base, uint32_t writer, uint32_t src, int32_t count, uint32_t rgb,
+                    uint32_t stack_word) {
+  uint32_t alpha = 0;
+  for (int32_t i = 0; i < count; ++i, src += 24) {
+    alpha = AlphaWord(Load32(base, src + 12));
+    uint32_t v = Load32(base, writer + 60) + Load32(base, writer + 8);
+    uint32_t z = Load32(base, src + 0), y = Load32(base, src - 4), x = Load32(base, src - 8);
+    Store32(base, v, x);
+    Store32(base, v + 4, y);
+    Store32(base, v + 8, z);
+    v = Load32(base, writer + 60) + Load32(base, writer + 28);
+    uint32_t tv = Load32(base, src + 8), tu = Load32(base, src + 4);
+    Store32(base, v, tu);
+    Store32(base, v + 4, tv);
+    Store32(base, Load32(base, writer + 60) + Load32(base, writer + 48), ((alpha & 0xFF) << 24) | rgb);
+    Store32(base, writer + 60, Load32(base, writer + 60) + Load32(base, writer + 4));
+  }
+  if (count > 0) Store32(base, stack_word, alpha);
+}
+
+uint32_t ParticleRgb(uint8_t* base) {
+  const uint8_t* c = Host(base, kParticleRgb);
+  return (uint32_t(c[0]) << 16) | (uint32_t(c[1]) << 8) | c[2];
+}
+
+void ParticleVertices(PPCContext& ctx, uint8_t* base) {
+  const uint32_t obj = ctx.r3.u32, matrix_src = ctx.r4.u32;
+  const uint64_t arg = ctx.r5.u64;
+  const uint32_t old_sp = ctx.r1.u32;
+  const uint64_t old_lr = ctx.lr;
+  const uint32_t sp = old_sp - 336;
+  Store32(base, sp, old_sp);  // stwu r1,-336(r1)
+  ctx.r1.u32 = sp;
+  ctx.lr = 0x8234916C;
+  sub_8233F0D8(ctx, base);
+  const uint32_t writer = ctx.r3.u32;
+  if (*Host(base, obj) != 0 && *Host(base, obj + 1) == 0) {
+    ctx.r3.u64 = sp + 96;
+    ctx.lr = 0x82349190;
+    sub_8233D9F0(ctx, base);
+    Store32(base, sp + 108, 1);
+    Store32(base, sp + 112, 0);
+    Store32(base, sp + 128, 0);
+    Store32(base, sp + 116, 6);
+    Store32(base, sp + 120, 7);
+    Store32(base, sp + 96, 42);
+    for (uint32_t i = 0; i < 16; ++i) Store32(base, sp + 208 + 4 * i, Load32(base, matrix_src + 4 * i));
+    const int32_t frame = int32_t(Load32(base, obj + 68) + 1);
+    ctx.fpscr.disableFlushMode();
+    const uint32_t zero = Load32(base, kZero);
+    Store32(base, sp + 256, zero);
+    Store32(base, sp + 260, zero);
+    Store32(base, sp + 264, zero);
+    const int32_t buffer = frame % 2;
+    ctx.lr = 0x82349210;
+    sub_823486E0(ctx, base);
+    const uint32_t list = Load32(base, ctx.r3.u32);
+    Store32(base, sp + 144, list);
+    if (list) {
+      const int32_t total = int32_t(Load32(base, obj + uint32_t((buffer + 19) << 2)));
+      const uint32_t records = Load32(base, obj + uint32_t((buffer + 21) << 2));
+      int32_t done = 0;
+      while (total > 0) {
+        int32_t n = total - done;
+        if (n >= 4000) n = 4000;
+        ctx.r3.u64 = writer;
+        ctx.r4.u64 = 2;
+        ctx.r5.u64 = sp + 96;
+        ctx.r6.s64 = n;
+        ctx.r7.u64 = 9;
+        ctx.r8.u64 = 0;
+        ctx.r9.u64 = sp + 208;
+        ctx.r10.u64 = arg;
+        ctx.lr = 0x82349288;
+        sub_8233F140(ctx, base);
+        if (n > 0) {
+          const uint32_t src = uint32_t(done) * 24 + records + 8;
+          const uint32_t rgb = ParticleRgb(base);
+          done += n;
+          ctx.fpscr.disableFlushMode();
+          WriteParticles(base, writer, src, n, rgb, sp + 80);
+        }
+        ctx.r3.u64 = writer;
+        ctx.r4.u64 = sp + 96;
+        ctx.lr = 0x82349350;
+        sub_8233F778(ctx, base);
+        if (!(done < total)) break;
+      }
+    }
+    ctx.r3.u64 = sp + 96;
+    ctx.lr = 0x82349360;
+    sub_8233DA50(ctx, base);
+  }
+  ctx.r1.u32 = old_sp;
+  ctx.lr = old_lr;  // restored by the epilogue
+}
+
+// Check mode for the particles: the translated function runs; begin/end of each of its batches
+// are watched and the batch's vertices are compared with WriteParticles on the same records.
+struct ParticleCheck {
+  bool active = false;
+  uint32_t writer = 0, records = 0, done = 0, vertex = 0;
+  int32_t count = 0;
+};
+thread_local ParticleCheck t_check;
+
+void CheckBatch(uint8_t* base) {
+  ParticleCheck& c = t_check;
+  if (c.count <= 0) return;
+  const uint32_t stride = Load32(base, c.writer + 4), o_pos = Load32(base, c.writer + 8),
+                 o_uv = Load32(base, c.writer + 28), o_col = Load32(base, c.writer + 48);
+  const uint32_t rgb = ParticleRgb(base);
+  bool same = Load32(base, c.writer + 60) == c.vertex + uint32_t(c.count) * stride;
+  uint32_t src = c.done * 24 + c.records + 8, v = c.vertex;
+  for (int32_t i = 0; same && i < c.count; ++i, src += 24, v += stride) {
+    same = Load32(base, v + o_pos) == Load32(base, src - 8) && Load32(base, v + o_pos + 4) == Load32(base, src - 4) &&
+           Load32(base, v + o_pos + 8) == Load32(base, src) && Load32(base, v + o_uv) == Load32(base, src + 4) &&
+           Load32(base, v + o_uv + 4) == Load32(base, src + 8) &&
+           Load32(base, v + o_col) == (((AlphaWord(Load32(base, src + 12)) & 0xFF) << 24) | rgb);
+  }
+  uint64_t batches = g_particle_batches.fetch_add(1) + 1;
+  if (!same) {
+    uint64_t m = g_particle_mismatches.fetch_add(1) + 1;
+    if (m <= 20) REXLOG_WARN("[native-check] particles MISMATCH writer={:08X} count={}", c.writer, c.count);
+  }
+  if ((batches & 0x3FF) == 0)
+    REXLOG_INFO("[native-check] particles batches={} mismatches={}", batches, g_particle_mismatches.load());
+  c.done += uint32_t(c.count);
+  c.count = 0;
+}
+
+// ---------------------------------------------------------------------------------- normalize
+constexpr uint32_t kEpsilon = 0x82038920;
+
+void Normalize(PPCContext& ctx, uint8_t* base) {
+  const uint32_t dst = ctx.r3.u32, src = ctx.r4.u32, sp = ctx.r1.u32;
+  // lvx/lvx/lvsl/vperm: 16 bytes at src from the blocks holding src and src+11.
+  const V lo = LoadA(base, src);
+  const V shift = simde_mm_load_si128(reinterpret_cast<const V*>(&rex::ppc::VectorShiftTableL[(src & 0xF) * 16]));
+  Store32(base, sp + 20, dst);
+  ctx.fpscr.disableFlushMode();
+  const uint32_t eps = Load32(base, kEpsilon);
+  for (uint32_t i = 0; i < 4; ++i) Store32(base, sp - 16 + 4 * i, eps);
+  const V hi = LoadA(base, src + 11);
+  const F v = AsF(rex::ppc::simde_mm_perm_epi8_(lo, hi, shift));
+  ctx.fpscr.enableFlushModeUnconditional();
+  const F len2 = simde_mm_dp_ps(v, v, 0xEF);
+  const F e = AsF(LoadA(base, sp - 16));
+  F r;
+  if (simde_mm_movemask_ps(simde_mm_cmpge_ps(e, len2)) == 0xF) {
+    r = AsF(simde_mm_set1_epi32(0));
+  } else {
+    ctx.fpscr.enableFlushMode();
+    F rs = simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(len2));
+    const F half = simde_mm_mul_ps(simde_mm_cvtepi32_ps(simde_mm_set1_epi32(1)), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x3F000000))));
+    const F rs2 = simde_mm_mul_ps(rs, rs);
+    const F h = simde_mm_mul_ps(len2, half);
+    const F corr = simde_mm_xor_ps(simde_mm_sub_ps(simde_mm_mul_ps(h, rs2), half), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000))));
+    rs = simde_mm_add_ps(simde_mm_mul_ps(rs, corr), rs);
+    StoreA(base, sp - 16, AsV(rs));
+    r = simde_mm_mul_ps(v, rs);
+  }
+  alignas(16) uint32_t lanes[4];
+  simde_mm_store_si128(reinterpret_cast<V*>(lanes), AsV(r));
+  Store32(base, dst & ~3u, lanes[3]);
+  Store32(base, (Load32(base, sp + 20) + 4) & ~3u, lanes[2]);
+  Store32(base, (Load32(base, sp + 20) + 8) & ~3u, lanes[1]);
+  ctx.r3.u64 = Load32(base, sp + 20);
+}
+}  // namespace
+
+namespace {
+// ---------------------------------------------------------------------------------- constants
+// Bits of the device's dirty mask (+16) for constants [first, first + count), one per 4 constants,
+// counted from the top. The shifts are srad/srd: 7-bit amounts, 64 and up fill with the sign/zero.
+uint64_t ConstantDirtyBits(uint32_t first, uint32_t count) {
+  const uint32_t lo = first >> 2, hi = (first + count - 1) >> 2;
+  const uint32_t span = (hi - lo) & 0x7F, shift = lo & 0x7F;
+  const uint64_t run = span >= 64 ? ~uint64_t(0) : uint64_t(int64_t(INT64_MIN) >> span);
+  return shift >= 64 ? 0 : run >> shift;
+}
+
+void SetConstants(uint8_t* base, uint32_t device, uint32_t first, uint32_t source, uint32_t count) {
+  // Memory order on both sides, so no byte swap: lvlx + lvrx is an unaligned 16-byte load.
+  const uint8_t* src = Host(base, source);
+  uint8_t* dst = Host(base, (device + ((first + 120) << 4)) & ~0xFu);
+  for (uint32_t i = 0; i < count; ++i) {
+    simde_mm_store_si128(reinterpret_cast<V*>(dst + i * 16),
+                         simde_mm_loadu_si128(reinterpret_cast<const V*>(src + i * 16)));
+  }
+  Store64(base, device + 16, Load64(base, device + 16) | ConstantDirtyBits(first, count));
+}
+
+// -------------------------------------------------------------------------------- parameter name
+uint32_t FindParameter(uint8_t* base, uint32_t table, uint32_t name) {
+  const uint32_t count = Load32(base, table + 16);
+  if (!count) return 0;
+  const uint32_t entries = Load32(base, table + 36);
+  const char* wanted = reinterpret_cast<const char*>(Host(base, name));
+  for (uint32_t i = 0; i < count; ++i) {
+    const char* own = reinterpret_cast<const char*>(Host(base, Load32(base, entries + 4 + i * 140)));
+    if (*own == *wanted && std::strcmp(own, wanted) == 0) return entries + i * 140;
+  }
+  return 0;
+}
+
+// --------------------------------------------------------------------------- effect parameters
+constexpr uint32_t kCommitGate = 0x8282C740;     // with the effect's +696, selects the second table
+constexpr uint32_t kCommitSecondTable = 0x82A0FFAC;
+constexpr uint32_t kCommitFrame = 448;
+
+uint32_t Rotl(uint32_t v, int n) { return (v << n) | (v >> (32 - n)); }
+
+// Calls each(entry) for the 16-byte entries whose bit is set in both the dirty mask and a list,
+// runs of bits from the top, 1024 bytes of entries per 64-bit word.
+template <class F>
+void WalkDirty(uint8_t* base, uint32_t count_at, uint32_t mask, uint32_t table, uint32_t list_at, uint32_t entries_at,
+               F&& each) {
+  for (uint32_t k = 0; k < Load32(base, count_at); ++k) {
+    uint32_t entry = Load32(base, table + entries_at) + (k << 10);
+    uint64_t bits = Load64(base, mask + k * 8) & Load64(base, Load32(base, table + list_at) + k * 8);
+    while (bits) {
+      const int skip = __builtin_clzll(bits);
+      entry += uint32_t(skip) << 4;
+      const uint64_t rest = bits << skip;
+      const int run = ~rest ? __builtin_clzll(~rest) : 64;
+      const uint32_t end = entry + (uint32_t(run) << 4);
+      bits = run >= 64 ? 0 : rest << run;
+      do {
+        each(entry);
+        entry += 16;
+      } while (entry < end);
+    }
+  }
+}
+
+// One group of parameters: value handles at index+4 of entry word 0, values in `values`.
+struct CommitGroup {
+  uint32_t index, values, table, mask, count_at, entries_at, lists_at;
+};
+
+uint32_t ValueAddress(uint8_t* base, const CommitGroup& g, uint32_t entry) {
+  const uint32_t slot = (Rotl(Load32(base, entry), 17) & 0x1FFF8) + g.index;
+  return (Rotl(Load32(base, slot + 4), 4) & 0xFFFF0) + g.values;
+}
+
+// Float parameters: 1-4 vectors copied into the device's constants, memory order on both sides.
+void CommitFloats(uint8_t* base, const CommitGroup& g, uint32_t device, uint32_t list_at, uint32_t word, uint32_t first_reg,
+                  uint32_t dirty_at) {
+  WalkDirty(base, g.count_at, g.mask, g.table, list_at, g.entries_at, [&](uint32_t entry) {
+    const uint32_t w = Load32(base, entry + word);
+    const uint32_t first = w & 0x3FF, count = ((w >> 10) & 3) + 1;
+    const uint32_t src = ValueAddress(base, g, entry), dst = device + ((first + first_reg) << 4);
+    for (uint32_t i = 0; i < count; ++i) {
+      const V v = simde_mm_load_si128(reinterpret_cast<const V*>(Host(base, (src + i * 16) & ~0xFu)));
+      simde_mm_store_si128(reinterpret_cast<V*>(Host(base, (dst + i * 16) & ~0xFu)), v);
+    }
+    Store64(base, device + dirty_at, Load64(base, device + dirty_at) | ConstantDirtyBits(first, count));
+  });
+}
+
+void CommitGroupValues(PPCContext& ctx, uint8_t* base, const CommitGroup& g, uint32_t device) {
+  const uint32_t sp = ctx.r1.u32;
+  using Setter = void (*)(PPCContext&, uint8_t*);
+  // Ints: float value truncated with saturation, last three lanes from the entry's aux vector.
+  auto ints = [&](uint32_t list_at, uint32_t word, uint32_t byte_at, Setter setter) {
+    WalkDirty(base, g.count_at, g.mask, g.table, list_at, g.entries_at, [&](uint32_t entry) {
+      const uint32_t aux = Load32(base, g.table + 80) + (uint32_t(*Host(base, entry + byte_at)) << 4);
+      simde_mm_store_si128(reinterpret_cast<V*>(ctx.v0.u8), LoadA(base, ValueAddress(base, g, entry)));
+      ctx.fpscr.enableFlushMode();
+      simde_mm_store_si128(reinterpret_cast<V*>(ctx.v0.s32), rex::ppc::simde_mm_vctsxs(simde_mm_load_ps(ctx.v0.f32)));
+      simde_mm_store_si128(reinterpret_cast<V*>(ctx.v13.u8), LoadA(base, aux));
+      simde_mm_store_ps(ctx.v0.f32, simde_mm_blend_ps(simde_mm_load_ps(ctx.v0.f32),
+                                                      simde_mm_permute_ps(simde_mm_load_ps(ctx.v13.f32), 228), 7));
+      StoreA(base, sp + 160, simde_mm_load_si128(reinterpret_cast<const V*>(ctx.v0.u8)));
+      const uint32_t w = Load32(base, entry + word);
+      ctx.r3.u64 = device;
+      ctx.r4.u64 = Rotl(w, 20) & 0xFF;
+      ctx.r5.u64 = sp + 160;
+      ctx.r6.u64 = (Rotl(w, 12) & 3) + 1;
+      ctx.lr = 0x824F4B74;
+      setter(ctx, base);
+    });
+  };
+  auto bools = [&](uint32_t list_at, uint32_t word, uint32_t byte_at, Setter setter) {
+    WalkDirty(base, g.count_at, g.mask, g.table, list_at, g.entries_at, [&](uint32_t entry) {
+      simde_mm_store_si128(reinterpret_cast<V*>(ctx.v0.u8), LoadA(base, ValueAddress(base, g, entry)));
+      ctx.fpscr.enableFlushMode();
+      simde_mm_store_si128(reinterpret_cast<V*>(ctx.v0.u32), rex::ppc::simde_mm_vctuxs(simde_mm_load_ps(ctx.v0.f32)));
+      StoreA(base, sp + 256, simde_mm_load_si128(reinterpret_cast<const V*>(ctx.v0.u8)));
+      const uint32_t w = Load32(base, entry + word);
+      ctx.r3.u64 = device;
+      ctx.r4.u64 = *Host(base, entry + byte_at);
+      ctx.r5.u64 = sp + 256;
+      ctx.r6.u64 = (Rotl(w, 2) & 3) + 1;
+      ctx.lr = 0x824F4D44;
+      setter(ctx, base);
+    });
+  };
+  auto samplers = [&](uint32_t list_at, uint32_t word) {
+    WalkDirty(base, g.count_at, g.mask, g.table, list_at, g.entries_at, [&](uint32_t entry) {
+      const uint32_t texture = Load32(base, ValueAddress(base, g, entry));
+      ctx.r3.u64 = device;
+      ctx.r4.u64 = Rotl(Load32(base, entry + word), 10) & 0xFF;
+      ctx.r5.u64 = texture;
+      ctx.lr = 0x824F4ED0;
+      sub_82476EF8(ctx, base);
+    });
+  };
+  ints(g.lists_at + 8, 4, 13, sub_82478A68);
+  ints(g.lists_at + 12, 8, 12, sub_82478AB8);
+  bools(g.lists_at + 16, 4, 15, sub_824789B8);
+  bools(g.lists_at + 20, 8, 14, sub_82478A10);
+  samplers(g.lists_at + 24, 4);
+  samplers(g.lists_at + 28, 8);
+}
+
+void CommitParameters(PPCContext& ctx, uint8_t* base) {
+  const uint32_t effect = ctx.r3.u32;
+  const uint64_t old_lr = ctx.lr;
+  const uint32_t old_sp = ctx.r1.u32;
+  const uint32_t sp = old_sp - kCommitFrame;
+  Store32(base, sp, old_sp);  // stwu r1,-448(r1)
+  ctx.r1.u32 = sp;
+
+  const uint32_t device = Load32(base, effect + 700);
+  const uint32_t first_table = Load32(base, effect + 536);
+  const uint32_t second_mask = Load32(base, effect + 256);
+  const uint32_t second_index = Load32(base, Load32(base, effect + 268));
+  const uint32_t second_values = Load32(base, Load32(base, effect + 300));
+
+  const CommitGroup first{Load32(base, effect + 264), Load32(base, effect + 296), first_table, effect,
+                          effect + 288, 64, 0};
+  CommitFloats(base, first, device, first.lists_at + 0, 4, 120, 16);
+  CommitFloats(base, first, device, first.lists_at + 4, 8, 376, 24);
+  CommitGroupValues(ctx, base, first, device);
+
+  // The second group uses the shared table when the effect and the gate are both set.
+  const uint32_t shared = Load32(base, kCommitSecondTable);
+  const bool use_shared = Load32(base, effect + 696) != 0 && Load32(base, kCommitGate) != 0;
+  const CommitGroup second{second_index, second_values, use_shared ? shared : first_table, second_mask,
+                           effect + 292, 68, 32};
+  CommitFloats(base, second, device, second.lists_at + 0, 4, 120, 16);
+  CommitFloats(base, second, device, second.lists_at + 4, 8, 376, 24);
+  CommitGroupValues(ctx, base, second, device);
+
+  std::memset(Host(base, effect & ~127u), 0, 128);  // dcbzl: the dirty masks
+  std::memset(Host(base, Load32(base, effect + 256) & ~127u), 0, 128);
+  ctx.r1.u32 = old_sp;
+  ctx.lr = old_lr;
+}
+
+void CountCheck(std::atomic<uint64_t>& calls, std::atomic<uint64_t>& mismatches, bool same, const char* what) {
+  const uint64_t n = calls.fetch_add(1) + 1;
+  if (!same) {
+    uint64_t m = mismatches.fetch_add(1) + 1;
+    if (m <= 20) REXLOG_WARN("[native-check] {} MISMATCH", what);
+  }
+  if ((n & 0xFFFFF) == 0) REXLOG_INFO("[native-check] {} calls={} mismatches={}", what, n, mismatches.load());
+}
+}  // namespace
+
+REX_HOOK_RAW(sub_82478728) {
+  if (!g_constants_enabled || !NativeOn()) {
+    __imp__sub_82478728(ctx, base);
+    return;
+  }
+  const uint32_t device = ctx.r3.u32, first = ctx.r4.u32, source = ctx.r5.u32, count = ctx.r6.u32;
+  if (!g_check) {
+    SetConstants(base, device, first, source, count);
+    return;
+  }
+  const uint64_t mask = Load64(base, device + 16) | ConstantDirtyBits(first, count);
+  __imp__sub_82478728(ctx, base);
+  const uint8_t* src = Host(base, source);
+  const uint8_t* dst = Host(base, (device + ((first + 120) << 4)) & ~0xFu);
+  const bool same = Load64(base, device + 16) == mask && std::memcmp(src, dst, size_t(count) * 16) == 0;
+  CountCheck(g_constant_calls, g_constant_mismatches, same, "constants");
+}
+
+REX_HOOK_RAW(sub_82341E68) {
+  if (!g_param_enabled || !NativeOn()) {
+    __imp__sub_82341E68(ctx, base);
+    return;
+  }
+  if (!g_check) {
+    ctx.r3.u64 = FindParameter(base, ctx.r3.u32, ctx.r4.u32);
+    return;
+  }
+  const uint32_t native = FindParameter(base, ctx.r3.u32, ctx.r4.u32);
+  __imp__sub_82341E68(ctx, base);
+  CountCheck(g_param_calls, g_param_mismatches, ctx.r3.u64 == native, "parameter");
+}
+
+REX_HOOK_RAW(sub_824F4770) {
+  if (!g_commit_enabled || !NativeOn() || g_check) {
+    __imp__sub_824F4770(ctx, base);
+    return;
+  }
+  CommitParameters(ctx, base);
+}
+
+REX_HOOK_RAW(sub_82349150) {
+  if (g_particles_enabled && NativeOn()) {
+    if (!g_check) {
+      ParticleVertices(ctx, base);
+      return;
+    }
+    // Check: remember where this call's records are, then let the translated code run.
+    const uint32_t obj = ctx.r3.u32;
+    const int32_t buffer = int32_t(Load32(base, obj + 68) + 1) % 2;
+    t_check = ParticleCheck{true, 0, Load32(base, obj + uint32_t((buffer + 21) << 2)), 0, 0, 0};
+    __imp__sub_82349150(ctx, base);
+    t_check.active = false;
+    return;
+  }
+  __imp__sub_82349150(ctx, base);
+}
+
+REX_HOOK_RAW(sub_8233F140) {
+  const uint32_t writer = ctx.r3.u32;
+  const int32_t count = ctx.r6.s32;
+  __imp__sub_8233F140(ctx, base);
+  if (t_check.active) {
+    t_check.writer = writer;
+    t_check.count = count;
+    t_check.vertex = Load32(base, writer + 60);
+  }
+}
+
+REX_HOOK_RAW(sub_8233F778) {
+  if (t_check.active) CheckBatch(base);
+  __imp__sub_8233F778(ctx, base);
+}
+
+REX_HOOK_RAW(sub_824AD0A8) {
+  if (!g_normalize_enabled || !NativeOn()) {
+    __imp__sub_824AD0A8(ctx, base);
+    return;
+  }
+  if (!g_check) {
+    Normalize(ctx, base);
+    return;
+  }
+  const uint32_t dst = ctx.r3.u32, sp = ctx.r1.u32;
+  uint8_t before_dst[12], before_lo[16], before_hi[4];
+  std::memcpy(before_dst, Host(base, dst & ~3u), 12);
+  std::memcpy(before_lo, Host(base, sp - 16), 16);
+  std::memcpy(before_hi, Host(base, sp + 20), 4);
+  const uint64_t r3 = ctx.r3.u64, r4 = ctx.r4.u64;
+  Normalize(ctx, base);
+  uint8_t native_dst[12], native_lo[16];
+  std::memcpy(native_dst, Host(base, dst & ~3u), 12);
+  std::memcpy(native_lo, Host(base, sp - 16), 16);
+  const uint64_t native_r3 = ctx.r3.u64;
+  std::memcpy(Host(base, dst & ~3u), before_dst, 12);
+  std::memcpy(Host(base, sp - 16), before_lo, 16);
+  std::memcpy(Host(base, sp + 20), before_hi, 4);
+  ctx.r3.u64 = r3;
+  ctx.r4.u64 = r4;
+  __imp__sub_824AD0A8(ctx, base);
+  const bool same = std::memcmp(Host(base, dst & ~3u), native_dst, 12) == 0 &&
+                    std::memcmp(Host(base, sp - 16), native_lo, 16) == 0 && ctx.r3.u64 == native_r3;
+  const uint64_t calls = g_normalize_calls.fetch_add(1) + 1;
+  if (!same) {
+    uint64_t m = g_normalize_mismatches.fetch_add(1) + 1;
+    if (m <= 20) REXLOG_WARN("[native-check] normalize MISMATCH dst={:08X} src={:08X}", dst, uint32_t(r4));
+  }
+  if ((calls & 0xFFFFF) == 0)
+    REXLOG_INFO("[native-check] normalize calls={} mismatches={}", calls, g_normalize_mismatches.load());
+}

@@ -1,0 +1,14 @@
+{
+  "title": "DreamWorks Madagascar 3: The Video Game",
+  "titleId": "44500801",
+  "mediaId": "1457EFAA",
+  "platform": "Xbox 360",
+  "architecture": "PowerPC",
+  "executable": "default.xex",
+  "imageBase": "0x82000000",
+  "entryPoint": "0x822C1F50",
+  "version": "0x00000001",
+  "baseVersion": "0x00000001",
+  "discNumber": 1,
+  "discCount": 1
+}

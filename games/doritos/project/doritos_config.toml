@@ -1,0 +1,4 @@
+# Doritos Crash Course codegen configuration.
+#
+# Start with the XEX/PData-derived function set. Add only confirmed missing
+# functions or hook addresses here after static analysis; do not guess sizes.

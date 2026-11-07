@@ -1,0 +1,82 @@
+# fifastreet3 - ReXGlue Recompiled Project
+#
+# SDK boilerplate lives in generated/rexglue.cmake.
+
+cmake_minimum_required(VERSION 3.25)
+project(fifastreet3 LANGUAGES CXX)
+# Native layers shared by the ports (../../../shared).
+set(PORTS_SHARED "${CMAKE_CURRENT_SOURCE_DIR}/../../../shared")
+# This game's own sources first (port_game.h and the headers the shared files include).
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src ${PORTS_SHARED}/src ${PORTS_SHARED}/src/native_audio ${PORTS_SHARED}/src/platform)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+include(generated/rexglue.cmake)
+
+# Sources
+set(FIFASTREET3_SOURCES
+    src/main.cpp
+    ${PORTS_SHARED}/src/pc_settings.cpp
+    src/pc_theme.cpp
+    src/post_effects.cpp
+    src/native/gfx_system.cpp
+    src/native/renderer.cpp
+    src/native/guest_texture.cpp
+    src/native/native_hooks.cpp
+    src/game_natives.cpp
+    src/menu_hooks.cpp
+    src/apt_menu.cpp
+    src/timing_diag.cpp
+    src/xbox_online.cpp
+    src/native/xenos_hlsl.cpp
+    ${PORTS_SHARED}/src/native_audio/xma_engine.cpp
+    ${PORTS_SHARED}/src/native_audio/audio_system.cpp
+    ${PORTS_SHARED}/src/native_audio/audio_exports.cpp
+)
+
+if(WIN32)
+    add_executable(fifastreet3 WIN32 ${FIFASTREET3_SOURCES})
+else()
+    add_executable(fifastreet3 ${FIFASTREET3_SOURCES})
+endif()
+
+rexglue_setup_target(fifastreet3)
+target_link_libraries(fifastreet3 PRIVATE rex::xxhash rex::libavcodec rex::libavutil)
+if(WIN32)
+    target_link_libraries(fifastreet3 PRIVATE d3d11 dxgi)
+endif()
+# Public headers of the SDK's FFmpeg build (LGPL 2.1, see third_party/ffmpeg) for the XMA decoder.
+target_include_directories(fifastreet3 PRIVATE third_party/ffmpeg/include)
+
+# Offline check of the Xenos -> HLSL translator (compiles the extracted shaders with FXC).
+if(WIN32)
+    add_executable(fs3_shader_test tools/shader_test.cpp src/native/xenos_hlsl.cpp)
+    target_link_libraries(fs3_shader_test PRIVATE rex::runtime)
+endif()
+
+# Vulkan option of the settings menu: DXVK's d3d11.dll/dxgi.dll in vulkan\ next to the
+# executable (pc_settings.cpp loads them by full path when "API grafica" is Vulkan).
+set(DXVK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/dxvk-3.1.1" CACHE PATH
+    "DXVK release for Windows (x64/d3d11.dll, x64/dxgi.dll, LICENSE)")
+if(WIN32 AND EXISTS "${DXVK_DIR}/x64/d3d11.dll")
+    add_custom_command(TARGET fifastreet3 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:fifastreet3>/vulkan"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXVK_DIR}/x64/d3d11.dll" "${DXVK_DIR}/x64/dxgi.dll"
+                "$<TARGET_FILE_DIR:fifastreet3>/vulkan/")
+    if(EXISTS "${DXVK_DIR}/LICENSE")
+        add_custom_command(TARGET fifastreet3 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXVK_DIR}/LICENSE"
+                    "$<TARGET_FILE_DIR:fifastreet3>/vulkan/LICENSE.dxvk.txt")
+    endif()
+endif()
+
+# Native HLSL compiler for Linux (no Windows compiler DLL).
+include(${PORTS_SHARED}/src/platform/native_shader_compiler.cmake)
+if(TARGET native_shader_compiler)
+    foreach(_native_target IN ITEMS fifastreet3)
+        if(TARGET ${_native_target})
+            target_link_libraries(${_native_target} PRIVATE native_shader_compiler)
+        endif()
+    endforeach()
+endif()

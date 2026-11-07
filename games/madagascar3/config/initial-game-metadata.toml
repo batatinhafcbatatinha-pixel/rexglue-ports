@@ -1,0 +1,15 @@
+# Historical descriptive metadata; not a ReXGlue codegen manifest.
+# Canonical input: ../project/madagascar3_manifest.toml
+# ReXGlue manifest for DreamWorks Madagascar 3: The Video Game
+[game]
+name = "Madagascar 3: The Video Game"
+title_id = "44500801"
+media_id = "1457EFAA"
+executable = "default.xex"
+entry_point = "0x822C1F50"
+image_base = "0x82000000"
+
+[runtime]
+platform = "xbox360"
+renderer = "d3d11"
+audio = "xma"

@@ -1,0 +1,4850 @@
+#include "port_game.h"
+#include "../platform/native_byteorder.h"
+#include "../platform/native_host_window.h"
+#if PORT_GAME == PORT_GAME_COPA2014
+// Copa 2014 native renderer (Direct3D 11). See renderer.h.
+#else /* street4 wc2010 */
+// FIFA Street 4 native renderer (Direct3D 11). See renderer.h.
+#endif /* PORT_GAME */
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#ifndef _WIN32
+#include "../platform/native_win32_posix.h"
+#endif
+
+#if PORT_GAME == PORT_GAME_COPA2014
+#include <d3d11_4.h>
+#else /* street4 wc2010 */
+#include <d3d11_1.h>
+#endif /* PORT_GAME */
+#include "../platform/native_shader_compiler.h"
+#include <dxgi1_2.h>
+
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <bit>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <deque>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <thread>
+#include <vector>
+
+#include <fmt/format.h>
+#include <rex/cvar.h>
+#include <rex/logging.h>
+#include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
+#if PORT_GAME == PORT_GAME_COPA2014
+#include <rex/system/thread_state.h>
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+#include <rex/system/xmemory.h>
+#include <rex/ui/window.h>
+#ifndef _WIN32
+#include <rex/exception_handler.h>
+#endif
+
+#include "renderer.h"
+#if PORT_GAME == PORT_GAME_COPA2014
+#include "post_effects.h"
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+#include "render_profile.h"
+#include "pc_game_info.h"
+#include "shader_translator.h"
+#include "texture_loader.h"
+
+#if PORT_GAME == PORT_GAME_COPA2014
+namespace copa {
+#elif PORT_GAME == PORT_GAME_WC2010
+namespace wc2010 {
+#else /* street4 */
+namespace street4 {
+#endif /* PORT_GAME */
+
+namespace natives {
+#if PORT_GAME == PORT_GAME_COPA2014
+bool NativeOn();  // game_natives.cpp (COPA_NATIVE_AB)
+#elif PORT_GAME == PORT_GAME_WC2010
+bool NativeOn();  // game_natives.cpp (WC2010_NATIVE_AB)
+#else /* street4 */
+bool NativeOn();  // game_natives.cpp (STREET4_NATIVE_AB)
+#endif /* PORT_GAME */
+void FrameTick();
+}  // namespace natives
+
+namespace {
+// Same as TiledOffset2D (texture_loader.cpp), inlined for the resolve write-back loop.
+inline int32_t TiledOffset2DInline(int32_t x, int32_t y, uint32_t pitch, uint32_t log2_bpb) {
+  pitch = (pitch + 31) & ~31u;
+  int32_t macro = ((x >> 5) + (y >> 5) * int32_t(pitch >> 5)) << (log2_bpb + 7);
+  int32_t micro = ((x & 7) + ((y & 0xE) << 2)) << log2_bpb;
+  int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
+  return ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
+         (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
+}
+
+template <typename T>
+struct Com {
+  T* p = nullptr;
+  Com() = default;
+  Com(const Com&) = delete;
+  Com& operator=(const Com&) = delete;
+  Com(Com&& o) noexcept : p(o.p) { o.p = nullptr; }
+  Com& operator=(Com&& o) noexcept {
+    if (this != &o) {
+      reset();
+      p = o.p;
+      o.p = nullptr;
+    }
+    return *this;
+  }
+  ~Com() { reset(); }
+  void reset() {
+    if (p) p->Release();
+    p = nullptr;
+  }
+  T** put() {
+    reset();
+    return &p;
+  }
+  T* get() const { return p; }
+  T* operator->() const { return p; }
+  explicit operator bool() const { return p != nullptr; }
+};
+
+uint64_t Hash64(const void* data, size_t size, uint64_t seed = 0x9E3779B97F4A7C15ull) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  uint64_t h = seed ^ (size * 0xC2B2AE3D27D4EB4Full);
+  size_t i = 0;
+  for (; i + 8 <= size; i += 8) {
+    uint64_t v;
+    std::memcpy(&v, p + i, 8);
+    v *= 0x87C37B91114253D5ull;
+    v = (v << 31) | (v >> 33);
+    h ^= v * 0x4CF5AD432745937Full;
+    h = ((h << 27) | (h >> 37)) * 5 + 0x52DCE729;
+  }
+  for (; i < size; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
+  h ^= h >> 33;
+  h *= 0xFF51AFD7ED558CCDull;
+  h ^= h >> 33;
+  return h;
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+// COPA_TRACE=<first frame>:<frame count>: log every draw/clear/resolve of those frames.
+// COPA_TRACE=t<n>:<count>: start at the frame after the n-th frame that used tiling.
+// COPA_TRACE=s<seconds>:<count>: start at the first frame after that many seconds.
+#elif PORT_GAME == PORT_GAME_WC2010
+// WC2010_TRACE=<first frame>:<frame count>: log every draw/clear/resolve of those frames.
+// WC2010_TRACE=t<n>:<count>: start at the frame after the n-th frame that used tiling.
+// WC2010_TRACE=s<seconds>:<count>: start at the first frame after that many seconds.
+#else /* street4 */
+// STREET4_TRACE=<first frame>:<frame count>: log every draw/clear/resolve of those frames.
+// STREET4_TRACE=t<n>:<count>: start at the frame after the n-th frame that used tiling.
+// STREET4_TRACE=s<seconds>:<count>: start at the first frame after that many seconds.
+#endif /* PORT_GAME */
+struct TraceWindow {
+  uint64_t first = ~0ull, count = 0, tiled_frames_wanted = 0, tiled_frames = 0;
+  uint64_t last_tiled_frame = ~0ull;
+  std::chrono::steady_clock::time_point deadline{};
+  bool timed = false;
+  TraceWindow() {
+#if PORT_GAME == PORT_GAME_COPA2014
+    const char* e = std::getenv("COPA_TRACE");
+#elif PORT_GAME == PORT_GAME_WC2010
+    const char* e = std::getenv("WC2010_TRACE");
+#else /* street4 */
+    const char* e = std::getenv("STREET4_TRACE");
+#endif /* PORT_GAME */
+    if (!e) return;
+    count = 1;
+    if (const char* c = std::strchr(e, ':')) count = std::strtoull(c + 1, nullptr, 10);
+    if (*e == 't') {
+      tiled_frames_wanted = std::strtoull(e + 1, nullptr, 10);
+    } else if (*e == 's') {
+      timed = true;
+      deadline = std::chrono::steady_clock::now() + std::chrono::seconds(std::strtoull(e + 1, nullptr, 10));
+    } else {
+      first = std::strtoull(e, nullptr, 10);
+    }
+  }
+  void OnTiling(uint64_t frame) {
+    if (!tiled_frames_wanted || frame == last_tiled_frame) return;
+    last_tiled_frame = frame;
+    if (++tiled_frames == tiled_frames_wanted) first = frame + 1;
+  }
+};
+TraceWindow& Trace() {
+  static TraceWindow w;
+  return w;
+}
+#if PORT_GAME == PORT_GAME_COPA2014
+// Starts tracing at `frame` for `count` frames (diagnostics triggered at run time).
+void TraceFrom(uint64_t frame, uint64_t count) {
+  auto& w = Trace();
+  w.first = frame;
+  w.count = count;
+}
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+bool TraceFrame(uint64_t frame) {
+  auto& w = Trace();
+  if (w.timed && w.first == ~0ull && std::chrono::steady_clock::now() >= w.deadline) w.first = frame + 1;
+  return frame >= w.first && frame < w.first + w.count;
+#if PORT_GAME == PORT_GAME_COPA2014
+#elif PORT_GAME == PORT_GAME_WC2010
+}
+// Diagnostics: WC2010_TRACE_SURFACE=<w>x<h> traces every draw, clear and resolve whose window
+// (scissor extent) has that size, in any frame (passes whose frame number varies between runs,
+// like load-time generated maps).
+bool TraceSurface(uint32_t width, uint32_t height) {
+  static const char* ts = std::getenv("WC2010_TRACE_SURFACE");
+  return ts && *ts && fmt::format("{}x{}", width, height) == ts;
+#else /* street4 */
+}
+// Diagnostics: STREET4_TRACE_SURFACE=<w>x<h> traces every draw, clear and resolve whose window
+// (scissor extent) has that size, in any frame (passes whose frame number varies between runs,
+// like load-time generated maps).
+bool TraceSurface(uint32_t width, uint32_t height) {
+  static const char* ts = std::getenv("STREET4_TRACE_SURFACE");
+  return ts && *ts && fmt::format("{}x{}", width, height) == ts;
+#endif /* PORT_GAME */
+}
+
+float AsFloat(uint32_t v) {
+  float f;
+  std::memcpy(&f, &v, 4);
+  return f;
+}
+
+uint32_t VirtualToPhysical(uint32_t address) {
+  // GPU view of the CPU physical mappings (0xA0000000/0xC0000000/0xE0000000).
+  return (address & 0x1FFFFFFF) + (((address >> 20) + 0x200) & 0x1000);
+}
+
+// --------------------------------------------------------------------------- formats
+DXGI_FORMAT ColorRtFormat(uint32_t f) {
+  switch (f) {
+    case 0: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case 1: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    case 2: case 10: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case 3: case 12: return DXGI_FORMAT_R16G16B16A16_FLOAT;  // 7e3 float
+    case 4: case 6: return DXGI_FORMAT_R16G16_FLOAT;
+    case 5: case 7: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case 14: return DXGI_FORMAT_R32_FLOAT;
+    case 15: return DXGI_FORMAT_R32G32_FLOAT;
+    default: return DXGI_FORMAT_R8G8B8A8_UNORM;
+  }
+}
+
+// Host format a resolve destination (xenos::ColorFormat, numbered like TextureFormat) uses.
+DXGI_FORMAT ResolveDestFormat(uint32_t color_format) {
+  switch (color_format) {
+    case 2: case 8: case 9: return DXGI_FORMAT_R8_UNORM;
+    case 4: return DXGI_FORMAT_B5G6R5_UNORM;
+    case 3: return DXGI_FORMAT_B5G5R5A1_UNORM;
+    case 6: case 14: case 50: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case 7: case 54: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case 10: return DXGI_FORMAT_R8G8_UNORM;
+    case 15: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case 16: case 17: case 55: case 56: return DXGI_FORMAT_R11G11B10_FLOAT;
+    case 24: return DXGI_FORMAT_R16_UNORM;
+    case 25: return DXGI_FORMAT_R16G16_UNORM;
+    case 26: return DXGI_FORMAT_R16G16B16A16_UNORM;
+    case 30: return DXGI_FORMAT_R16_FLOAT;
+    case 31: return DXGI_FORMAT_R16G16_FLOAT;
+    case 32: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case 36: return DXGI_FORMAT_R32_FLOAT;
+    case 37: return DXGI_FORMAT_R32G32_FLOAT;
+    case 38: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case 63: return DXGI_FORMAT_R16G16B16A16_FLOAT;  // 2_10_10_10_FLOAT (7e3)
+    default: return DXGI_FORMAT_R8G8B8A8_UNORM;
+  }
+}
+
+D3D11_COMPARISON_FUNC CompareFunc(uint32_t f) {
+  static const D3D11_COMPARISON_FUNC t[8] = {
+      D3D11_COMPARISON_NEVER,   D3D11_COMPARISON_LESS,      D3D11_COMPARISON_EQUAL,
+      D3D11_COMPARISON_LESS_EQUAL, D3D11_COMPARISON_GREATER, D3D11_COMPARISON_NOT_EQUAL,
+      D3D11_COMPARISON_GREATER_EQUAL, D3D11_COMPARISON_ALWAYS};
+  return t[f & 7];
+}
+D3D11_STENCIL_OP StencilOp(uint32_t o) {
+  static const D3D11_STENCIL_OP t[8] = {
+      D3D11_STENCIL_OP_KEEP,     D3D11_STENCIL_OP_ZERO,     D3D11_STENCIL_OP_REPLACE,
+      D3D11_STENCIL_OP_INCR_SAT, D3D11_STENCIL_OP_DECR_SAT, D3D11_STENCIL_OP_INVERT,
+      D3D11_STENCIL_OP_INCR,     D3D11_STENCIL_OP_DECR};
+  return t[o & 7];
+}
+D3D11_BLEND BlendFactor(uint32_t f, bool alpha) {
+  switch (f) {
+    case 0: return D3D11_BLEND_ZERO;
+    case 1: return D3D11_BLEND_ONE;
+    case 4: return alpha ? D3D11_BLEND_SRC_ALPHA : D3D11_BLEND_SRC_COLOR;
+    case 5: return alpha ? D3D11_BLEND_INV_SRC_ALPHA : D3D11_BLEND_INV_SRC_COLOR;
+    case 6: return D3D11_BLEND_SRC_ALPHA;
+    case 7: return D3D11_BLEND_INV_SRC_ALPHA;
+    case 8: return alpha ? D3D11_BLEND_DEST_ALPHA : D3D11_BLEND_DEST_COLOR;
+    case 9: return alpha ? D3D11_BLEND_INV_DEST_ALPHA : D3D11_BLEND_INV_DEST_COLOR;
+    case 10: return D3D11_BLEND_DEST_ALPHA;
+    case 11: return D3D11_BLEND_INV_DEST_ALPHA;
+    case 12: case 14: return D3D11_BLEND_BLEND_FACTOR;
+    case 13: case 15: return D3D11_BLEND_INV_BLEND_FACTOR;
+    case 16: return D3D11_BLEND_SRC_ALPHA_SAT;
+    default: return D3D11_BLEND_ONE;
+  }
+}
+D3D11_BLEND_OP BlendOp(uint32_t o) {
+  switch (o) {
+    case 1: return D3D11_BLEND_OP_SUBTRACT;
+    case 2: return D3D11_BLEND_OP_MIN;
+    case 3: return D3D11_BLEND_OP_MAX;
+    case 4: return D3D11_BLEND_OP_REV_SUBTRACT;
+    default: return D3D11_BLEND_OP_ADD;
+  }
+}
+D3D11_TEXTURE_ADDRESS_MODE AddressMode(uint32_t m) {
+  switch (m) {
+    case 0: return D3D11_TEXTURE_ADDRESS_WRAP;
+    case 1: return D3D11_TEXTURE_ADDRESS_MIRROR;
+    case 2: case 4: return D3D11_TEXTURE_ADDRESS_CLAMP;
+    case 3: case 5: return D3D11_TEXTURE_ADDRESS_MIRROR_ONCE;
+    default: return D3D11_TEXTURE_ADDRESS_BORDER;
+  }
+}
+
+// --------------------------------------------------------------------------- shaders
+using D3DCompileFn = decltype(&D3DCompile);
+
+const char* kRectListGs = R"HLSL(
+struct V { float4 position : SV_Position; float4 interp[16] : TEXCOORD0; float4 misc : TEXCOORD16; };
+V Lerp3(V a, V b, V c) {  // b + c - a
+  V r;
+  r.position = b.position + c.position - a.position;
+  [unroll] for (uint i = 0; i < 16; ++i) r.interp[i] = b.interp[i] + c.interp[i] - a.interp[i];
+  r.misc = b.misc + c.misc - a.misc;
+  return r;
+}
+[maxvertexcount(4)]
+void main(triangle V v[3], inout TriangleStream<V> s) {
+  float2 p0 = v[0].position.xy / v[0].position.w, p1 = v[1].position.xy / v[1].position.w,
+         p2 = v[2].position.xy / v[2].position.w;
+  float d01 = dot(p1 - p0, p1 - p0), d12 = dot(p2 - p1, p2 - p1), d20 = dot(p0 - p2, p0 - p2);
+  uint corner = (d12 >= d01 && d12 >= d20) ? 0 : (d20 >= d01 ? 1 : 2);
+  V c = v[corner], a = v[(corner + 1) % 3], b = v[(corner + 2) % 3];
+  s.Append(a); s.Append(c); s.Append(b); s.Append(Lerp3(c, a, b));
+  s.RestartStrip();
+}
+)HLSL";
+
+#if PORT_GAME == PORT_GAME_COPA2014
+const char* kBlitHlsl = R"HLSL(
+Texture2D<float4> src : register(t0);
+SamplerState samp : register(s0);
+cbuffer Blit : register(b0) { float4 src_rect; float4 params; };  // uv origin/size, scale
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs_main(uint id : SV_VertexID) {
+  O o;
+  float2 t = float2((id << 1) & 2, id & 2);
+  o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+  o.uv = src_rect.xy + t * src_rect.zw;
+  return o;
+}
+float4 ps_main(O i) : SV_Target {
+  float4 c = src.SampleLevel(samp, i.uv, 0) * params.x;
+  return params.y != 0.0 ? c.bgra : c;
+}
+float ps_depth(O i) : SV_Target { return src.SampleLevel(samp, i.uv, 0).r; }
+// MSAA depth to a single-sample float texture (sample 0), drawn over the whole target.
+Texture2DMS<float4> src_ms : register(t0);
+float ps_depth_ms(O i) : SV_Target { return src_ms.Load(int2(i.pos.xy), 0).r; }
+// MSAA color, average of the samples: same result as ResolveSubresource, for one rectangle.
+float4 ps_color_ms(O i) : SV_Target {
+  uint w, h, n;
+  src_ms.GetDimensions(w, h, n);
+  float4 c = 0;
+  for (uint k = 0; k < n; ++k) c += src_ms.Load(int2(i.pos.xy), k);
+  return c / float(n);
+}
+)HLSL";
+#else /* street4 wc2010 */
+const char* kBlitHlsl = R"HLSL(
+Texture2D<float4> src : register(t0);
+SamplerState samp : register(s0);
+cbuffer Blit : register(b0) { float4 src_rect; float4 params; };  // uv origin/size, scale
+struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+O vs_main(uint id : SV_VertexID) {
+  O o;
+  float2 t = float2((id << 1) & 2, id & 2);
+  o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+  o.uv = src_rect.xy + t * src_rect.zw;
+  return o;
+}
+float4 ps_main(O i) : SV_Target {
+  float4 c = src.SampleLevel(samp, i.uv, 0) * params.x;
+  return params.y != 0.0 ? c.bgra : c;
+}
+float ps_depth(O i) : SV_Target { return src.SampleLevel(samp, i.uv, 0).r; }
+// MSAA depth to a single-sample float texture (sample 0), drawn over the whole target.
+Texture2DMS<float4> src_ms : register(t0);
+float ps_depth_ms(O i) : SV_Target { return src_ms.Load(int2(i.pos.xy), 0).r; }
+)HLSL";
+#endif /* PORT_GAME */
+
+struct ShaderEntry {
+  ea_postfx::Pass effect_pass = ea_postfx::Pass::Other;
+  TranslatedShader meta;
+  std::string name;
+  Com<ID3D11VertexShader> vs;
+  Com<ID3D11PixelShader> ps;
+  bool failed = false;
+};
+
+// Sizes are in guest pixels; the host texture is `scale` times larger (internal resolution, see
+// RendererImpl::ScaleFor).
+struct RenderTarget {
+  uint32_t edram_base = 0, format = 0, pitch = 0;
+  bool depth = false;
+  uint32_t width = 0, height = 0;
+  float scale = 1.0f;
+  uint32_t samples = 1;  // MSAA (PC settings)
+  Com<ID3D11Texture2D> texture;
+  Com<ID3D11RenderTargetView> rtv;
+  Com<ID3D11DepthStencilView> dsv;
+  Com<ID3D11ShaderResourceView> srv;
+  // MSAA: single-sample copy for resolves (RendererImpl::SingleSampleSrv), current unless the
+  // target was drawn to or cleared since (tiled frames resolve the same surface several times).
+  bool single_stale = true;
+  uint64_t single_epoch = 0;
+  Com<ID3D11Texture2D> single;
+  Com<ID3D11ShaderResourceView> single_srv;
+  Com<ID3D11RenderTargetView> single_rtv;
+  uint64_t last_used = 0;
+};
+
+// CPU write watch of guest memory a cached copy came from (RendererImpl::ValidateWatched).
+struct WriteWatchState {
+  uint64_t gen = 0;    // sum of the page generations when the pages were protected
+  uint32_t quiet = 0;  // consecutive validations without a change
+  uint32_t need = 2;   // unchanged validations before protecting (doubles on false alarms)
+  bool armed = false;
+};
+
+struct HostTexture {
+  std::vector<uint8_t> validation_bytes;
+  TextureDesc desc;
+  Com<ID3D11Texture2D> texture;
+  Com<ID3D11ShaderResourceView> srv2d, srv_array, srv_cube;
+  Com<ID3D11Texture3D> volume;  // 3D textures, also kept as a volume for filtered sampling
+  Com<ID3D11ShaderResourceView> srv_volume;
+  uint64_t sample_hash = 0;
+  uint64_t validated_frame = ~0ull;
+  uint64_t last_used = 0;
+  WriteWatchState watch;
+  bool cube = false;
+  uint32_t array_size = 1;
+};
+
+struct ResolvedTexture {
+  uint32_t address = 0, width = 0, height = 0, format = 0;
+  float scale = 1.0f;  // host texels per guest texel (internal resolution)
+  Com<ID3D11Texture2D> texture;
+  Com<ID3D11RenderTargetView> rtv;
+  Com<ID3D11ShaderResourceView> srv;
+  uint64_t guest_hash = 0;
+  uint64_t frame = 0;
+  bool bgra = false;  // an 8_8_8_8 color resolve, stored as BGRA like guest memory
+};
+
+// Converted guest index buffer (byte-swapped, primitive reset as 0xFFFFFFFF, base vertex added),
+// kept while the guest indices stay the same.
+struct IndexBufferEntry {
+  std::vector<uint8_t> raw;  // the guest bytes it was converted from
+  Com<ID3D11Buffer> buffer;
+  WriteWatchState watch;
+  uint64_t last_used = 0;
+};
+
+struct VertexBufferEntry {
+  std::vector<uint8_t> validation_bytes;
+  Com<ID3D11Buffer> buffer;
+  Com<ID3D11ShaderResourceView> srv;
+  uint32_t capacity = 0;
+  uint64_t hash = 0;
+  uint64_t validated_frame = ~0ull;
+  uint64_t last_used = 0;
+  WriteWatchState watch;
+};
+
+// The D3D11 immediate context is single-threaded; CPU waits (FlushWriteBacks) can come from
+// threads other than the one issuing the draws.
+static std::recursive_mutex& ApiMutex() {
+  static std::recursive_mutex m;
+  return m;
+}
+using ApiLock = std::lock_guard<std::recursive_mutex>;
+
+class RendererImpl {
+ public:
+  bool Ready() { return EnsureDevice(); }
+
+  void Draw(const GuestDevice& dev, const DrawRequest& draw);
+  void Resolve(const GuestDevice& dev, const ResolveRequest& req);
+  void ClearBound(const GuestDevice& dev, uint32_t color_targets, const float rgba[4],
+                  bool depth, float z, bool stencil, uint8_t s, const int32_t* rects,
+                  uint32_t rect_count);
+  void Present(const uint8_t* fetch);
+  uint64_t frame() const { return frame_; }
+  // Diagnostics: writes a texture (8-bit RGBA or 16-bit float formats) as a 24-bit BMP.
+  void DumpTexture(ID3D11Texture2D* texture, const std::string& path);
+  uint32_t ReadPixel(ID3D11Texture2D* texture, uint32_t x, uint32_t y);
+  void QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, uint32_t dest_pitch,
+                      uint32_t endian, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t fence);
+  // Stores queued resolve results in guest memory: those issued before `fence` (`all`, when the
+  // CPU waits for that fence), or those of earlier frames (at present, when the GPU is done).
+  void DrainWriteBacks(bool all, uint32_t fence = 0);
+#if PORT_GAME == PORT_GAME_COPA2014
+  ID3D11Texture2D* GuestSizeCopy(const ResolvedTexture& r, uint32_t key, int32_t x, int32_t y, int32_t w,
+                                 int32_t h);
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+  // pack4444: host RGBA8 texels stored as 4_4_4_4 (bpp 2).
+  void StoreTiled(const uint8_t* data, uint32_t row_pitch, uint32_t dest_base, uint32_t dest_pitch, uint32_t endian,
+                  uint32_t bpp, int32_t x, int32_t y, int32_t w, int32_t h, bool pack4444 = false);
+#if PORT_GAME == PORT_GAME_COPA2014
+#else /* street4 wc2010 */
+  ID3D11Texture2D* GuestSizeCopy(const ResolvedTexture& r, uint32_t key, int32_t x, int32_t y, int32_t w,
+                                 int32_t h);
+  // Tiled frames are drawn once for the union of the tiles, but each tile's resolve clears its
+  // own rectangle. D3D11 clears depth only whole, so a tile's depth clear waits until the tiles
+  // cleared cover the surface (or tiling ends); clearing at once would erase the depth the next
+  // tile still resolves.
+  struct TileDepthClear {
+    Com<ID3D11DepthStencilView> dsv;
+    float z = 0;
+    uint8_t stencil = 0;
+    uint64_t area = 0;
+  } tile_depth_clear_;
+  void FlushTileDepthClear() {
+    if (tile_depth_clear_.dsv) ++tile_depth_clear_epoch_;
+    if (tile_depth_clear_.dsv)
+      context_->ClearDepthStencilView(tile_depth_clear_.dsv.get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
+                                      tile_depth_clear_.z, tile_depth_clear_.stencil);
+    tile_depth_clear_ = {};
+  }
+#endif /* PORT_GAME */
+  void SetTiling(bool active, uint32_t width, uint32_t height) {
+#if PORT_GAME == PORT_GAME_COPA2014
+#else /* street4 wc2010 */
+    if (!active) FlushTileDepthClear();
+#endif /* PORT_GAME */
+    if (active) Trace().OnTiling(frame_);
+    if (active) ++frame_tilings_;
+#if PORT_GAME == PORT_GAME_COPA2014
+    if (!active) FlushTileDepthClear();
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+    tiling_ = active && width && height;
+    tiling_width_ = width;
+    tiling_height_ = height;
+  }
+
+ private:
+  bool EnsureDevice();
+  bool EnsureSwapChain();
+  uint8_t* Virtual(uint32_t address) { return GuestPtr(membase_, address); }
+  const uint8_t* Physical(uint32_t address) { return physbase_ + (address & 0x1FFFFFFF); }
+
+  ShaderEntry* GetShader(ShaderStage stage, const ShaderMicrocode& code, const ShaderKey& key);
+  bool Compile(const std::string& source, const char* entry, const char* target,
+               std::vector<uint8_t>& out, const std::string& cache_name);
+#if PORT_GAME == PORT_GAME_COPA2014
+  RenderTarget* GetRenderTarget(bool depth, uint32_t base, uint32_t format, uint32_t pitch,
+                                uint32_t height);
+#else /* street4 wc2010 */
+  RenderTarget* GetRenderTarget(const GuestDevice& dev, bool depth, uint32_t base, uint32_t format,
+                                uint32_t pitch, uint32_t height);
+#endif /* PORT_GAME */
+  ID3D11ShaderResourceView* GetTexture(const uint32_t fetch[6], TextureDimension dim,
+                                       float size_out[4],
+                                       ID3D11ShaderResourceView** volume_out = nullptr);
+  ID3D11SamplerState* GetSampler(const uint32_t fetch[6]);
+  ID3D11ShaderResourceView* GetVertexBuffer(uint32_t physical, uint32_t bytes, bool cacheable,
+                                            const uint8_t* host);
+  bool BuildIndices(const DrawRequest& draw, D3D11_PRIMITIVE_TOPOLOGY& topology,
+                    std::vector<uint32_t>& indices, bool& use_indices, bool& rect_list,
+                    const GuestDevice& dev);
+  void SetupStates(const GuestDevice& dev, uint32_t color_mask_active, bool depth_active);
+  void UpdateDynamicBuffer(Com<ID3D11Buffer>& buffer, uint32_t& capacity, UINT bind,
+                           const void* data, uint32_t bytes);
+  ResolvedTexture* GetResolved(uint32_t address, uint32_t width, uint32_t height,
+                               uint32_t format, bool create);
+  void BlitTo(ID3D11RenderTargetView* rtv, uint32_t dst_w, uint32_t dst_h, D3D11_VIEWPORT vp,
+              ID3D11ShaderResourceView* src, float src_w, float src_h, float u0, float v0,
+              float u1, float v1, bool depth, bool swap_rb = false, bool point = false,
+              ID3D11PixelShader* shader = nullptr);
+#if PORT_GAME == PORT_GAME_COPA2014
+  ID3D11ShaderResourceView* SingleSampleSrv(RenderTarget& rt, const D3D11_RECT* part = nullptr);
+#else /* street4 wc2010 */
+  ID3D11ShaderResourceView* SingleSampleSrv(RenderTarget& rt);
+#endif /* PORT_GAME */
+  // MSAA (PC settings, live) on the targets the internal resolution scales; resolves read a
+  // single-sample copy (SingleSampleSrv).
+  uint32_t msaa_ = 1, msaa_wanted_ = 0, bound_samples_ = 1;
+  uint32_t SamplesFor(uint32_t width) const { return width >= 640 ? msaa_ : 1; }
+#if PORT_GAME == PORT_GAME_COPA2014
+  uint64_t single_copied_ = 0, single_reused_ = 0, rect_resolves_ = 0, tile_depth_clear_epoch_ = 0;
+#else /* street4 wc2010 */
+  uint64_t single_copied_ = 0, single_reused_ = 0, tile_depth_clear_epoch_ = 0;
+#endif /* PORT_GAME */
+  void UpdateMsaa() {
+    uint32_t want = uint32_t(pcs::MsaaSamples());
+    if (want == msaa_wanted_) return;
+    msaa_wanted_ = want;
+    uint32_t m = pcs::SupportedSamples(device_.get(), want,
+                                       {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                                        DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                        DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
+                                        DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT});
+#if PORT_GAME == PORT_GAME_COPA2014
+    if (m != msaa_) REXLOG_INFO("copa renderer: MSAA {}x -> {}x (asked {}x)", msaa_, m, want);
+#elif PORT_GAME == PORT_GAME_WC2010
+    if (m != msaa_) REXLOG_INFO("wc2010 renderer: MSAA {}x -> {}x (asked {}x)", msaa_, m, want);
+#else /* street4 */
+    if (m != msaa_) REXLOG_INFO("street4 renderer: MSAA {}x -> {}x (asked {}x)", msaa_, m, want);
+#endif /* PORT_GAME */
+    msaa_ = m;
+  }
+#if PORT_GAME == PORT_GAME_COPA2014
+  // Internal resolution. Render targets and resolve destinations at least 640 wide (the scene,
+#else /* street4 wc2010 */
+  // Internal resolution. Render passes and resolve destinations at least 640 wide (the scene,
+#endif /* PORT_GAME */
+  // half-resolution post-processing, shadow maps) are drawn scale_ times larger; smaller ones
+  // (light probes, reduction chains, lightmaps the CPU compresses) keep the guest size: scaling
+  // them gains nothing and changes values the game reads back (crowd lighting, exposure).
+#if PORT_GAME == PORT_GAME_COPA2014
+  float ScaleFor(uint32_t pitch) const { return pitch >= 640 ? scale_ : 1.0f; }
+#else /* street4 wc2010 */
+  float ScaleFor(uint32_t width) const { return width >= 640 ? scale_ : 1.0f; }
+#endif /* PORT_GAME */
+  static uint32_t ScaledSize(uint32_t v, float s) {
+    return std::max<uint32_t>(1, uint32_t(std::ceil(float(v) * s - 0.001f)));
+  }
+  static LONG ScaledCoord(LONG v, float s) { return LONG(std::lround(float(v) * s)); }
+  static D3D11_RECT ScaledRect(LONG x0, LONG y0, LONG x1, LONG y1, float s) {
+    return {ScaledCoord(x0, s), ScaledCoord(y0, s), ScaledCoord(x1, s), ScaledCoord(y1, s)};
+  }
+
+  // Device.
+  Com<ID3D11Device> device_;
+  Com<ID3D11DeviceContext> context_;
+  Com<ID3D11DeviceContext1> context1_;
+  Com<IDXGISwapChain1> swap_chain_;
+  Com<ID3D11RenderTargetView> backbuffer_rtv_;
+  HWND hwnd_ = nullptr;
+  uint32_t bb_width_ = 0, bb_height_ = 0;
+  bool device_failed_ = false;
+  D3DCompileFn compile_ = nullptr;
+  std::filesystem::path cache_dir_;
+  uint8_t* membase_ = nullptr;
+  uint8_t* physbase_ = nullptr;
+  // CPU write watch: page generations bumped by the memory system's write-protection
+#if PORT_GAME == PORT_GAME_COPA2014
+  // callbacks, so unchanged cached textures / vertex / index buffers skip the byte comparison.
+#else /* street4 wc2010 */
+  // callbacks, so unchanged cached textures / vertex buffers skip the byte comparison.
+#endif /* PORT_GAME */
+  static constexpr uint32_t kWatchPageShift = 12;
+  static constexpr uint32_t kWatchPages = 0x20000000u >> kWatchPageShift;
+  rex::memory::Memory* memory_ = nullptr;
+  std::unique_ptr<std::atomic<uint32_t>[]> write_gen_;
+  void* watch_handle_ = nullptr;
+  bool write_watch_ = false, write_watch_check_ = false;
+  uint64_t watch_misses_ = 0;
+  static std::pair<uint32_t, uint32_t> OnInvalidate(void* context, uint32_t start, uint32_t length, bool);
+  uint64_t WriteGen(uint32_t address, uint32_t size) const;
+  template <typename F>
+  bool ValidateWatched(WriteWatchState& w, uint32_t address, uint32_t size, const char* what, F&& changed_fn);
+  uint64_t frame_ = 0;
+  float scale_ = 1.0f;  // internal resolution (pcs::ResolutionScale), re-read after each frame
+  // Guest-size copies of scaled resolve results on their way to guest memory, by destination.
+  std::unordered_map<uint32_t, std::pair<Com<ID3D11Texture2D>, Com<ID3D11RenderTargetView>>> writeback_scratch_;
+  std::chrono::steady_clock::time_point next_present_{};
+  bool texture_reloaded_ = false;  // diagnostics: the slot being loaded replaced changed guest data
+  uint32_t frame_draws_ = 0, frame_tiled_draws_ = 0, frame_tilings_ = 0;
+  bool tiling_ = false;
+  uint32_t tiling_width_ = 0, tiling_height_ = 0;
+#if PORT_GAME == PORT_GAME_COPA2014
+  // Diagnostics (COPA_GLITCH_DETECT): draw summaries of the current and the previous frame.
+  bool glitch_log_enabled_ = std::getenv("COPA_GLITCH_DETECT") != nullptr;
+  std::vector<std::string> frame_draw_log_, prev_draw_log_;
+  // ...and RGBA8 copies of the screen-space shadow mask (resolved to 1C8EB000) of both frames.
+  struct Snap {
+    Com<ID3D11Texture2D> tex;
+    Com<ID3D11RenderTargetView> rtv;
+    bool valid = false;
+  };
+  Snap snap_[2][4];
+  int mask_snap_cur_ = 0;
+  // ...and the textures the first pitch draw (vs F0221E60) sampled in both frames.
+  std::vector<std::pair<int, Com<ID3D11ShaderResourceView>>> pitch_srvs_[2];
+  // ...and the color target 0 and depth-stencil of the pitch draws (vs F0221E60) of both frames,
+  // before the first one ([0]) and after the last one ([1]). Depth is kept in staging textures.
+  struct PitchCapture {
+    Com<ID3D11Texture2D> color;
+    Com<ID3D11ShaderResourceView> color_srv;
+    Com<ID3D11Texture2D> depth;
+    bool valid = false;
+  };
+  PitchCapture pitch_cap_[2][2];
+  // ...and copies of the textures the first pitch draw sampled, taken right after it.
+  struct SrvCapture {
+    Com<ID3D11Texture2D> tex;
+    Com<ID3D11ShaderResourceView> srv;
+    bool valid = false;
+  };
+  SrvCapture pitch_srv_cap_[2][32];
+  void CaptureSrv(SrvCapture& c, ID3D11ShaderResourceView* src) {
+    c.valid = false;
+    Com<ID3D11Resource> res;
+    src->GetResource(res.put());
+    D3D11_RESOURCE_DIMENSION dim;
+    res->GetType(&dim);
+    if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D) return;
+    D3D11_SHADER_RESOURCE_VIEW_DESC vd;
+    src->GetDesc(&vd);
+    if (vd.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D) return;
+    D3D11_TEXTURE2D_DESC sd, dd;
+    static_cast<ID3D11Texture2D*>(res.get())->GetDesc(&sd);
+    if (c.tex) c.tex->GetDesc(&dd);
+    if (!c.tex || dd.Width != sd.Width || dd.Height != sd.Height || dd.Format != sd.Format ||
+        dd.MipLevels != sd.MipLevels || dd.ArraySize != sd.ArraySize) {
+      c.tex.reset();
+      c.srv.reset();
+      sd.Usage = D3D11_USAGE_DEFAULT;
+      sd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      sd.CPUAccessFlags = 0;
+      sd.MiscFlags = 0;
+      device_->CreateTexture2D(&sd, nullptr, c.tex.put());
+      if (!c.tex) return;
+      device_->CreateShaderResourceView(c.tex.get(), &vd, c.srv.put());
+      if (!c.srv) return;
+    }
+    context_->CopyResource(c.tex.get(), res.get());
+    c.valid = true;
+  }
+  uint32_t pitch_draws_[2] = {};
+  // ...and the vertex shader constants of the first pitch draw of the last three frames.
+  std::array<uint32_t, 1024> pitch_vsc_[3] = {};
+  uint64_t pitch_vsc_frame_[3] = {};
+  void CapturePitch(PitchCapture& c, RenderTarget* color, RenderTarget* depth) {
+    auto copy = [this](Com<ID3D11Texture2D>& dst, ID3D11Texture2D* src, bool staging) {
+      D3D11_TEXTURE2D_DESC sd, dd;
+      src->GetDesc(&sd);
+      if (dst) dst->GetDesc(&dd);
+      if (!dst || dd.Width != sd.Width || dd.Height != sd.Height || dd.Format != sd.Format) {
+        dst.reset();
+        sd.Usage = staging ? D3D11_USAGE_STAGING : D3D11_USAGE_DEFAULT;
+        sd.BindFlags = staging ? 0 : D3D11_BIND_SHADER_RESOURCE;
+        sd.CPUAccessFlags = staging ? D3D11_CPU_ACCESS_READ : 0;
+        sd.MiscFlags = 0;
+        device_->CreateTexture2D(&sd, nullptr, dst.put());
+        if (!dst) return false;
+      }
+      context_->CopyResource(dst.get(), src);
+      return true;
+    };
+    c.valid = false;
+    if (color && color->texture) {
+      ID3D11Texture2D* old = c.color.get();
+      if (!copy(c.color, color->texture.get(), false)) return;
+      if (c.color.get() != old || !c.color_srv) {
+        c.color_srv.reset();
+        device_->CreateShaderResourceView(c.color.get(), nullptr, c.color_srv.put());
+      }
+    }
+    if (depth && depth->texture && !copy(c.depth, depth->texture.get(), true)) return;
+    c.valid = true;
+  }
+  // Writes depth (24-bit or float, stretched over the range below 1.0) as red and blue, stencil
+  // as green, and logs the range and a hash.
+  void DumpDepth(ID3D11Texture2D* staging, const std::string& path) {
+    D3D11_TEXTURE2D_DESC td;
+    staging->GetDesc(&td);
+    const bool f32 = td.Format == DXGI_FORMAT_R32G8X24_TYPELESS;
+    if (!f32 && td.Format != DXGI_FORMAT_R24G8_TYPELESS) return;
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(context_->Map(staging, 0, D3D11_MAP_READ, 0, &m))) return;
+    auto at = [&](uint32_t x, uint32_t y, float* z, uint8_t* s) {
+      const uint8_t* p = static_cast<const uint8_t*>(m.pData) + y * m.RowPitch + x * (f32 ? 8 : 4);
+      uint32_t v;
+      std::memcpy(&v, p, 4);
+      if (f32) {
+        *z = AsFloat(v);
+        *s = p[4];
+      } else {
+        *z = float(v & 0xFFFFFF) / 16777215.0f;
+        *s = uint8_t(v >> 24);
+      }
+    };
+    float lo = 1e30f, hi = -1e30f;
+    uint32_t far_count = 0, stencil_set = 0;
+    for (uint32_t y = 0; y < td.Height; ++y)
+      for (uint32_t x = 0; x < td.Width; ++x) {
+        float z;
+        uint8_t st;
+        at(x, y, &z, &st);
+        stencil_set += st != 0;
+        if (z >= 1.0f) { ++far_count; continue; }
+        lo = std::min(lo, z);
+        hi = std::max(hi, z);
+      }
+    uint64_t hash = 0;
+    for (uint32_t y = 0; y < td.Height; ++y)
+      hash = hash * 0x100000001B3ull ^ Hash64(static_cast<const uint8_t*>(m.pData) + y * m.RowPitch, td.Width * (f32 ? 8 : 4));
+    REXLOG_INFO("copa glitch depth {}: {}x{} range {:g}..{:g} far={} stencil!=0: {} hash={:016X}", path, td.Width,
+                td.Height, lo, hi, far_count, stencil_set, hash);
+    std::ofstream f(path, std::ios::binary);
+    uint32_t w = td.Width, h = td.Height, row = (w * 3 + 3) & ~3u, size = 54 + row * h;
+    uint8_t hdr[54] = {'B', 'M'};
+    std::memcpy(hdr + 2, &size, 4);
+    uint32_t off = 54, dib = 40, planes_bpp = 1 | (24 << 16);
+    std::memcpy(hdr + 10, &off, 4);
+    std::memcpy(hdr + 14, &dib, 4);
+    std::memcpy(hdr + 18, &w, 4);
+    std::memcpy(hdr + 22, &h, 4);
+    std::memcpy(hdr + 26, &planes_bpp, 4);
+    f.write(reinterpret_cast<char*>(hdr), 54);
+    std::vector<uint8_t> line(row);
+    float range = hi > lo ? hi - lo : 1.0f;
+    for (uint32_t y = 0; y < h; ++y) {
+      for (uint32_t x = 0; x < w; ++x) {
+        float z;
+        uint8_t st;
+        at(x, h - 1 - y, &z, &st);
+        uint8_t v = z >= 1.0f ? 255 : uint8_t(std::clamp((z - lo) / range, 0.0f, 1.0f) * 254.0f);
+        line[x * 3] = v;
+        line[x * 3 + 1] = st;
+        line[x * 3 + 2] = v;
+      }
+      f.write(reinterpret_cast<char*>(line.data()), row);
+    }
+    context_->Unmap(staging, 0);
+  }
+  void DumpSrv(ID3D11ShaderResourceView* srv, const std::string& path) {
+    Com<ID3D11Resource> res;
+    srv->GetResource(res.put());
+    D3D11_RESOURCE_DIMENSION dim;
+    res->GetType(&dim);
+    if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D) return;
+    D3D11_TEXTURE2D_DESC sdesc;
+    static_cast<ID3D11Texture2D*>(res.get())->GetDesc(&sdesc);
+    D3D11_TEXTURE2D_DESC td{std::min(sdesc.Width, 1024u), std::min(sdesc.Height, 1024u), 1, 1,
+                            DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, 0};
+    Com<ID3D11Texture2D> tmp;
+    Com<ID3D11RenderTargetView> tmp_rtv;
+    device_->CreateTexture2D(&td, nullptr, tmp.put());
+    if (!tmp) return;
+    device_->CreateRenderTargetView(tmp.get(), nullptr, tmp_rtv.put());
+    D3D11_VIEWPORT tvp{0, 0, float(td.Width), float(td.Height), 0, 1};
+    BlitTo(tmp_rtv.get(), td.Width, td.Height, tvp, srv, float(sdesc.Width), float(sdesc.Height), 0, 0, 1, 1, false);
+    DumpTexture(tmp.get(), path);
+  }
+  // Tiled frames are drawn once for the union of the tiles, but each tile's resolve clears its
+  // own rectangle. D3D11 clears depth only whole, so a tile's depth clear waits until the tiles
+  // cleared cover the surface (or tiling ends); clearing at once would erase the depth the next
+  // tile still resolves.
+  struct TileDepthClear {
+    Com<ID3D11DepthStencilView> dsv;
+    float z = 0;
+    uint8_t stencil = 0;
+    uint64_t area = 0;
+  } tile_depth_clear_;
+  void FlushTileDepthClear() {
+    if (tile_depth_clear_.dsv) ++tile_depth_clear_epoch_;
+    if (tile_depth_clear_.dsv)
+      context_->ClearDepthStencilView(tile_depth_clear_.dsv.get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
+                                      tile_depth_clear_.z, tile_depth_clear_.stencil);
+    tile_depth_clear_ = {};
+  }
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+
+  // Caches.
+  std::unordered_map<uint64_t, std::unique_ptr<ShaderEntry>> shaders_;
+  std::unordered_map<uint64_t, std::unique_ptr<RenderTarget>> render_targets_;
+  std::unordered_map<uint64_t, std::unique_ptr<HostTexture>> textures_;
+  std::unordered_map<uint32_t, std::unique_ptr<ResolvedTexture>> resolved_;
+  // Resolve results on their way to guest memory (see QueueWriteBack).
+  struct PendingWriteBack {
+    Com<ID3D11Texture2D> staging;
+    uint32_t dest_base, dest_pitch, endian, bpp;
+    int32_t x, y, w, h;
+    uint64_t frame;
+    uint32_t fence;  // last timestamp the D3D library issued before the resolve
+    bool steady;     // destination resolved every frame (see QueueWriteBack)
+#if PORT_GAME == PORT_GAME_COPA2014
+#else /* street4 wc2010 */
+    bool throttled;  // steady result between the once-a-second copies: stored only for a fence wait
+#endif /* PORT_GAME */
+    bool pack4444;   // 4_4_4_4 destination kept as RGBA8 on the host
+    uint64_t snapshot;  // guest memory there when queued (MemorySnapshot); changed = CPU reused it
+  };
+  // Strided hash of the guest memory a write-back covers.
+  uint64_t MemorySnapshot(uint32_t dest_base, uint32_t dest_pitch, uint32_t bpp, int32_t y, int32_t h) {
+    uint32_t extent = ((dest_pitch + 31) & ~31u) * ((uint32_t(y + h) + 31) & ~31u) * bpp;
+    uint32_t base = dest_base & 0x1FFFFFFF;
+    extent = std::min(extent, 0x20000000u - base);
+    if (extent <= 64 * 256) return Hash64(Physical(base), extent);
+    uint64_t hash = 0;
+    for (uint32_t i = 0; i < 64; ++i)
+      hash = Hash64(Physical(base + uint32_t(uint64_t(extent - 256) * i / 63)), 256, hash);
+    return hash;
+  }
+  struct WriteBackHistory {
+    uint64_t last_frame = ~0ull;   // last frame a resolve went to this destination
+    uint64_t queued_frame = ~0ull; // last frame a copy was queued
+    uint32_t streak = 0;           // frames with a resolve there, at most 3 frames apart
+  };
+  std::deque<PendingWriteBack> writebacks_;
+  std::unordered_map<uint32_t, uint32_t> writebacks_by_address_;
+  std::unordered_map<uint32_t, uint64_t> writeback_last_stored_;  // address -> frame
+  std::unordered_map<uint32_t, WriteBackHistory> writeback_history_;
+  // Steady destinations whose results the CPU has not read yet (see QueueWriteBack): the whole
+  // guest pages they cover stay inaccessible in the CPU views until the CPU touches them, and
+  // that access stores the latest resolve first (HandleOnDemandFault).
+  struct OnDemandWriteBack {
+    Com<ID3D11Texture2D> texture;  // the resolve destination, at internal resolution
+    Com<ID3D11ShaderResourceView> srv;
+    uint32_t width = 0, height = 0;
+    float scale = 1.0f;
+    uint32_t dest_base = 0, dest_pitch = 0, endian = 0, bpp = 0;
+    bool pack4444 = false;
+    int32_t x = 0, y = 0, w = 0, h = 0;
+    uint32_t first_page = 0, end_page = 0;  // physical, whole pages inside the destination
+    bool dirty = false, protected_pages = false;
+    bool cpu_polled = false;  // read by the CPU nearly every frame: periodic copies instead
+#if PORT_GAME == PORT_GAME_COPA2014
+#else /* street4 wc2010 */
+    bool reads_value = true;  // those reads fetched a value from inside, not the image from its start
+    uint64_t polled_frame = 0;
+#endif /* PORT_GAME */
+    uint64_t last_fault_frame = 0;
+    uint32_t close_faults = 0;
+    uint64_t last_resolve_frame = 0;
+    uint64_t stored_hash = 0;  // guest sample hash right after the last on-demand store
+    bool has_stored_hash = false;
+  };
+  std::recursive_mutex ondemand_mutex_;
+  std::unordered_map<uint32_t, OnDemandWriteBack> ondemand_;
+  bool ProtectOnDemand(const OnDemandWriteBack& od, DWORD protect);
+  void StoreOnDemand(OnDemandWriteBack& od);
+  void ExpireOnDemand();
+  bool OnDemandStored(uint32_t base, uint64_t guest_hash);
+#if PORT_GAME == PORT_GAME_COPA2014
+  bool OnDemandCovers(const OnDemandWriteBack& od, uintptr_t host_address);
+#else /* street4 wc2010 */
+  bool OnDemandCovers(const OnDemandWriteBack& od, uintptr_t host_address, uint32_t* offset = nullptr);
+#endif /* PORT_GAME */
+
+ public:
+  bool HandleOnDemandFault(uintptr_t host_address);
+
+ private:
+  std::vector<Com<ID3D11Texture2D>> staging_pool_;
+  std::unordered_map<uint64_t, std::unique_ptr<VertexBufferEntry>> vertex_buffers_;
+  std::unordered_map<uint64_t, std::unique_ptr<IndexBufferEntry>> index_buffers_;
+  ID3D11Buffer* cached_ib_ = nullptr;  // set by BuildIndices when the draw uses a cached buffer
+  uint32_t cached_index_count_ = 0;
+  std::vector<std::unique_ptr<VertexBufferEntry>> transient_vbs_;
+  size_t transient_next_ = 0;
+  std::unordered_map<uint64_t, Com<ID3D11SamplerState>> samplers_;
+  std::unordered_map<uint64_t, Com<ID3D11BlendState>> blend_states_;
+  std::unordered_map<uint64_t, Com<ID3D11DepthStencilState>> depth_states_;
+  std::unordered_map<uint64_t, Com<ID3D11RasterizerState>> raster_states_;
+
+  // Per-draw resources.
+  Com<ID3D11Buffer> cb_vs_, cb_ps_, cb_sys_, cb_blit_;
+  std::array<uint32_t, 1024> last_vs_constants_{}, last_ps_constants_{};
+  bool vs_constants_valid_ = false, ps_constants_valid_ = false;
+  Com<ID3D11Buffer> index_buffer_;
+  uint32_t index_capacity_ = 0;
+  Com<ID3D11GeometryShader> rect_gs_;
+  Com<ID3D11VertexShader> blit_vs_;
+#if PORT_GAME == PORT_GAME_COPA2014
+  Com<ID3D11PixelShader> blit_ps_, blit_depth_ps_, blit_depth_ms_ps_, blit_color_ms_ps_;
+#else /* street4 wc2010 */
+  Com<ID3D11PixelShader> blit_ps_, blit_depth_ps_, blit_depth_ms_ps_;
+#endif /* PORT_GAME */
+  Com<ID3D11SamplerState> linear_clamp_, point_clamp_;
+  Com<ID3D11RasterizerState> blit_raster_;
+  Com<ID3D11DepthStencilState> no_depth_;
+  RenderTarget* bound_color_[4] = {};
+  RenderTarget* bound_depth_ = nullptr;
+  std::vector<uint32_t> index_scratch_;
+  std::vector<uint8_t> upload_scratch_;
+  std::mutex mutex_;
+};
+
+// --------------------------------------------------------------------------- device
+RendererImpl* g_ondemand_owner = nullptr;
+
+#ifdef _WIN32
+LONG CALLBACK OnDemandFaultHandler(EXCEPTION_POINTERS* e) {
+  if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || !g_ondemand_owner)
+    return EXCEPTION_CONTINUE_SEARCH;
+#if PORT_GAME == PORT_GAME_COPA2014
+  {
+    // Diagnostics: guest null-page reads (intermittent boot crash). Logs the host code address
+    // and code addresses found on the stack (symbolize with llvm-symbolizer --obj=copa2014.exe).
+    uintptr_t addr = uintptr_t(e->ExceptionRecord->ExceptionInformation[1]);
+    uintptr_t base = uintptr_t(rex::Runtime::instance() ? rex::Runtime::instance()->memory()->virtual_membase() : nullptr);
+    static std::atomic<int> logged{0};
+    if (base && addr >= base && addr < base + 0x10000 && logged.fetch_add(1) < 4) {
+      HMODULE exe = GetModuleHandleW(nullptr);
+      auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<uint8_t*>(exe) +
+                                                     reinterpret_cast<IMAGE_DOS_HEADER*>(exe)->e_lfanew);
+      uintptr_t lo = uintptr_t(exe), hi = lo + nt->OptionalHeader.SizeOfImage;
+      std::string frames;
+      const uintptr_t* sp = reinterpret_cast<const uintptr_t*>(e->ContextRecord->Rsp);
+      for (int i = 0, n = 0; i < 512 && n < 24; ++i)
+        if (sp[i] >= lo && sp[i] < hi) frames += fmt::format(" {:X}", sp[i] - lo), ++n;
+      REXLOG_ERROR("copa null-page read guest {:08X}: rip=exe+{:X} stack:{}", uint32_t(addr - base),
+                   e->ContextRecord->Rip - lo, frames);
+      // Guest call chain from the PPC back chain (each frame: old r1 at 0(r1), LR at old r1 - 8).
+      if (auto* ts = rex::runtime::ThreadState::Get()) {
+        auto* c = ts->context();
+        auto be = [&](uint32_t a) {
+          uint32_t v;
+          std::memcpy(&v, reinterpret_cast<const uint8_t*>(base) + a, 4);
+          return native_host::ByteSwap32(v);
+        };
+        std::string chain;
+        uint32_t sp = c->r1.u32;
+        for (int i = 0; i < 24 && sp > 0x10000 && sp < 0xF0000000u; ++i) {
+          uint32_t prev = be(sp);
+          if (prev <= sp || prev - sp > 0x100000) break;
+          chain += fmt::format(" {:08X}", be(prev - 8));
+          sp = prev;
+        }
+        REXLOG_ERROR("copa null-page guest ctx: lr={:08X} r1={:08X} r3={:08X} r30={:08X} r31={:08X} chain:{}",
+                     uint32_t(c->lr), c->r1.u32, c->r3.u32, c->r30.u32, c->r31.u32, chain);
+      }
+    }
+  }
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+  return g_ondemand_owner->HandleOnDemandFault(uintptr_t(e->ExceptionRecord->ExceptionInformation[1]))
+             ? EXCEPTION_CONTINUE_EXECUTION
+             : EXCEPTION_CONTINUE_SEARCH;
+}
+#else
+// Linux: the SDK's host exception handler (SIGSEGV) reports the faulting address the same way.
+bool OnDemandFaultLinux(rex::arch::Exception* ex, void*) {
+  if (ex->code() != rex::arch::Exception::Code::kAccessViolation || !g_ondemand_owner) return false;
+  return g_ondemand_owner->HandleOnDemandFault(uintptr_t(ex->fault_address()));
+}
+#endif
+
+bool RendererImpl::EnsureDevice() {
+  if (device_) return EnsureSwapChain();
+  if (device_failed_) return false;
+  auto* runtime = rex::Runtime::instance();
+  if (!runtime) return false;
+  membase_ = runtime->memory()->virtual_membase();
+  physbase_ = runtime->memory()->physical_membase();
+#if PORT_GAME == PORT_GAME_COPA2014
+  // COPA_NO_WRITE_WATCH=1: compare the bytes of every cached texture / vertex buffer each
+  // frame as before. COPA_WRITE_WATCH_CHECK=1: compare anyway and log watch misses.
+  if (!std::getenv("COPA_NO_WRITE_WATCH")) {
+#elif PORT_GAME == PORT_GAME_WC2010
+  // WC2010_NO_WRITE_WATCH=1: compare the bytes of every cached texture / vertex buffer each
+  // frame as before. WC2010_WRITE_WATCH_CHECK=1: compare anyway and log watch misses.
+  if (!std::getenv("WC2010_NO_WRITE_WATCH")) {
+#else /* street4 */
+  // STREET4_NO_WRITE_WATCH=1: compare the bytes of every cached texture / vertex buffer each
+  // frame as before. STREET4_WRITE_WATCH_CHECK=1: compare anyway and log watch misses.
+  if (!std::getenv("STREET4_NO_WRITE_WATCH")) {
+#endif /* PORT_GAME */
+    memory_ = runtime->memory();
+    write_gen_ = std::make_unique<std::atomic<uint32_t>[]>(kWatchPages);
+    for (uint32_t p = 0; p < kWatchPages; ++p) write_gen_[p].store(1, std::memory_order_relaxed);
+    watch_handle_ = memory_->RegisterPhysicalMemoryInvalidationCallback(&RendererImpl::OnInvalidate, this);
+    write_watch_ = watch_handle_ != nullptr;
+#if PORT_GAME == PORT_GAME_COPA2014
+    write_watch_check_ = std::getenv("COPA_WRITE_WATCH_CHECK") != nullptr;
+#elif PORT_GAME == PORT_GAME_WC2010
+    write_watch_check_ = std::getenv("WC2010_WRITE_WATCH_CHECK") != nullptr;
+#else /* street4 */
+    write_watch_check_ = std::getenv("STREET4_WRITE_WATCH_CHECK") != nullptr;
+#endif /* PORT_GAME */
+  }
+  if (auto* window = runtime->display_window())
+    hwnd_ = static_cast<HWND>(native_host::WindowHandle(window));
+  if (!hwnd_) return false;
+
+  UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+#if PORT_GAME == PORT_GAME_COPA2014
+  if (std::getenv("COPA_D3D_DEBUG")) flags |= D3D11_CREATE_DEVICE_DEBUG;
+  // PC settings: graphics API (Direct3D 11 or Vulkan) and card chosen in the settings menu.
+#elif PORT_GAME == PORT_GAME_WC2010
+  if (std::getenv("WC2010_D3D_DEBUG")) flags |= D3D11_CREATE_DEVICE_DEBUG;
+  // PC settings: graphics API and card chosen in the settings menu. This module keeps its
+  // own copy of the settings state.
+  pcs::Configure(PcGameInfo(), false);
+#else /* street4 */
+  if (std::getenv("STREET4_D3D_DEBUG")) flags |= D3D11_CREATE_DEVICE_DEBUG;
+  // PC settings: graphics API and card chosen in the settings menu. This module keeps its
+  // own copy of the settings state.
+  pcs::Configure(PcGameInfo(), false);
+#endif /* PORT_GAME */
+  HRESULT hr = pcs::CreateDevice(flags, device_.put(), context_.put());
+  scale_ = pcs::ResolutionScale();
+#if PORT_GAME == PORT_GAME_COPA2014
+  if (scale_ != 1.0f) REXLOG_INFO("copa renderer: internal resolution x{:.3f}", scale_);
+#elif PORT_GAME == PORT_GAME_WC2010
+  if (scale_ != 1.0f) REXLOG_INFO("wc2010 renderer: internal resolution x{:.3f}", scale_);
+#else /* street4 */
+  if (scale_ != 1.0f) REXLOG_INFO("street4 renderer: internal resolution x{:.3f}", scale_);
+#endif /* PORT_GAME */
+  if (FAILED(hr)) {
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_ERROR("copa renderer: device creation failed ({:08X})", uint32_t(hr));
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_ERROR("wc2010 renderer: device creation failed ({:08X})", uint32_t(hr));
+#else /* street4 */
+    REXLOG_ERROR("street4 renderer: device creation failed ({:08X})", uint32_t(hr));
+#endif /* PORT_GAME */
+    device_failed_ = true;
+    return false;
+  }
+  UpdateMsaa();
+  context_->QueryInterface(__uuidof(ID3D11DeviceContext1),
+                           reinterpret_cast<void**>(context1_.put()));
+#if PORT_GAME == PORT_GAME_COPA2014
+  // On-demand resolve write-backs run on the CPU thread that touches the memory.
+  Com<ID3D11Multithread> multithread;
+  if (SUCCEEDED(context_->QueryInterface(__uuidof(ID3D11Multithread),
+                                         reinterpret_cast<void**>(multithread.put()))))
+    multithread->SetMultithreadProtected(TRUE);
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+  g_ondemand_owner = this;
+#ifdef _WIN32
+  AddVectoredExceptionHandler(1, OnDemandFaultHandler);
+#else
+  rex::arch::ExceptionHandler::Install(OnDemandFaultLinux, nullptr);
+#endif
+#ifdef _WIN32
+  HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+  if (compiler) compile_ = reinterpret_cast<D3DCompileFn>(GetProcAddress(compiler, "D3DCompile"));
+#else
+  compile_ = &D3DCompile;
+#endif
+  if (!compile_) {
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_ERROR("copa renderer: d3dcompiler_47.dll not available");
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_ERROR("wc2010 renderer: d3dcompiler_47.dll not available");
+#else /* street4 */
+    REXLOG_ERROR("street4 renderer: d3dcompiler_47.dll not available");
+#endif /* PORT_GAME */
+    device_failed_ = true;
+    return false;
+  }
+  cache_dir_ = runtime->cache_root().empty() ? std::filesystem::path("cache")
+                                             : runtime->cache_root();
+#if PORT_GAME == PORT_GAME_COPA2014
+  cache_dir_ /= "copa_shaders";
+#elif PORT_GAME == PORT_GAME_WC2010
+  cache_dir_ /= "wc2010_shaders";
+#else /* street4 */
+  cache_dir_ /= "street4_shaders";
+#endif /* PORT_GAME */
+  std::error_code ec;
+#ifndef _WIN32
+  cache_dir_ /= "vkd3d";
+#endif
+  std::filesystem::create_directories(cache_dir_, ec);
+
+  auto make_cb = [&](Com<ID3D11Buffer>& b, UINT size) {
+    D3D11_BUFFER_DESC d{};
+    d.ByteWidth = size;
+    d.Usage = D3D11_USAGE_DYNAMIC;
+    d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    device_->CreateBuffer(&d, nullptr, b.put());
+  };
+  make_cb(cb_vs_, 4096);
+  make_cb(cb_ps_, 4096);
+  make_cb(cb_sys_, (sizeof(SystemConstants) + 15) & ~15u);
+  make_cb(cb_blit_, 32);
+
+  std::vector<uint8_t> code;
+  // Cached by source hash too: a stale blit_ps without the red/blue swap swapped every
+  // 8_8_8_8 resolve's colors.
+  auto internal = [](const char* source, const char* name) {
+    return fmt::format("{}_{:08x}", name, static_cast<uint32_t>(Hash64(source, std::strlen(source))));
+  };
+  if (Compile(kRectListGs, "main", "gs_5_0", code, internal(kRectListGs, "rect_list_gs")))
+    device_->CreateGeometryShader(code.data(), code.size(), nullptr, rect_gs_.put());
+  if (Compile(kBlitHlsl, "vs_main", "vs_5_0", code, internal(kBlitHlsl, "blit_vs")))
+    device_->CreateVertexShader(code.data(), code.size(), nullptr, blit_vs_.put());
+  if (Compile(kBlitHlsl, "ps_main", "ps_5_0", code, internal(kBlitHlsl, "blit_ps")))
+    device_->CreatePixelShader(code.data(), code.size(), nullptr, blit_ps_.put());
+  if (Compile(kBlitHlsl, "ps_depth", "ps_5_0", code, internal(kBlitHlsl, "blit_depth_ps")))
+    device_->CreatePixelShader(code.data(), code.size(), nullptr, blit_depth_ps_.put());
+  if (Compile(kBlitHlsl, "ps_depth_ms", "ps_5_0", code, internal(kBlitHlsl, "blit_depth_ms_ps")))
+    device_->CreatePixelShader(code.data(), code.size(), nullptr, blit_depth_ms_ps_.put());
+#if PORT_GAME == PORT_GAME_COPA2014
+  if (Compile(kBlitHlsl, "ps_color_ms", "ps_5_0", code, internal(kBlitHlsl, "blit_color_ms_ps")))
+    device_->CreatePixelShader(code.data(), code.size(), nullptr, blit_color_ms_ps_.put());
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+
+  D3D11_SAMPLER_DESC sd{};
+  sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+  sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sd.MaxLOD = D3D11_FLOAT32_MAX;
+  device_->CreateSamplerState(&sd, linear_clamp_.put());
+  sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+  device_->CreateSamplerState(&sd, point_clamp_.put());
+  D3D11_RASTERIZER_DESC rd{};
+  rd.FillMode = D3D11_FILL_SOLID;
+  rd.CullMode = D3D11_CULL_NONE;
+  rd.DepthClipEnable = TRUE;
+  device_->CreateRasterizerState(&rd, blit_raster_.put());
+  D3D11_DEPTH_STENCIL_DESC dd{};
+  dd.DepthEnable = FALSE;
+  device_->CreateDepthStencilState(&dd, no_depth_.put());
+#if PORT_GAME == PORT_GAME_COPA2014
+  REXLOG_INFO("copa renderer: Direct3D 11 device ready (native rendering, no GPU emulation)");
+#elif PORT_GAME == PORT_GAME_WC2010
+  REXLOG_INFO("wc2010 renderer: Direct3D 11 device ready (native rendering, no GPU emulation)");
+#else /* street4 */
+  REXLOG_INFO("street4 renderer: Direct3D 11 device ready (native rendering, no GPU emulation)");
+#endif /* PORT_GAME */
+  return EnsureSwapChain();
+}
+
+bool RendererImpl::EnsureSwapChain() {
+  RECT rc;
+  if (!GetClientRect(hwnd_, &rc)) return false;
+  uint32_t w = std::max<LONG>(rc.right - rc.left, 1), h = std::max<LONG>(rc.bottom - rc.top, 1);
+  if (swap_chain_ && w == bb_width_ && h == bb_height_) return true;
+  if (!swap_chain_) {
+    Com<IDXGIDevice> dxgi_device;
+    device_->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(dxgi_device.put()));
+    Com<IDXGIAdapter> adapter;
+    dxgi_device->GetAdapter(adapter.put());
+    Com<IDXGIFactory2> factory;
+    adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(factory.put()));
+    DXGI_SWAP_CHAIN_DESC1 d{};
+    d.Width = w;
+    d.Height = h;
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    d.BufferCount = 2;
+    d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    d.Flags = pcs::SwapChainFlags();
+    if (FAILED(factory->CreateSwapChainForHwnd(device_.get(), hwnd_, &d, nullptr, nullptr,
+                                               swap_chain_.put()))) {
+#if PORT_GAME == PORT_GAME_COPA2014
+      REXLOG_ERROR("copa renderer: swap chain creation failed");
+#elif PORT_GAME == PORT_GAME_WC2010
+      REXLOG_ERROR("wc2010 renderer: swap chain creation failed");
+#else /* street4 */
+      REXLOG_ERROR("street4 renderer: swap chain creation failed");
+#endif /* PORT_GAME */
+      return false;
+    }
+    factory->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
+  } else {
+    backbuffer_rtv_.reset();
+    context_->OMSetRenderTargets(0, nullptr, nullptr);
+    swap_chain_->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, pcs::SwapChainFlags());
+  }
+  Com<ID3D11Texture2D> bb;
+  swap_chain_->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(bb.put()));
+  device_->CreateRenderTargetView(bb.get(), nullptr, backbuffer_rtv_.put());
+  bb_width_ = w;
+  bb_height_ = h;
+  return true;
+}
+
+bool RendererImpl::Compile(const std::string& source, const char* entry, const char* target,
+                           std::vector<uint8_t>& out, const std::string& cache_name) {
+  auto path = cache_dir_ / (cache_name + ".dxbc");
+  if (!cache_name.empty()) {
+    std::ifstream f(path, std::ios::binary);
+    if (f) {
+      out.assign(std::istreambuf_iterator<char>(f), {});
+      if (!out.empty()) return true;
+    }
+  }
+  Com<ID3DBlob> code, errors;
+  HRESULT hr = compile_(source.data(), source.size(), cache_name.c_str(), nullptr, nullptr, entry,
+                        target, D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, code.put(), errors.put());
+  if (FAILED(hr)) {
+    // fxc's optimizer reports false "used without having been completely initialized"
+    // errors (X4000) on some large translated shaders; unoptimized compilation accepts them.
+    Com<ID3DBlob> errors_retry;
+    hr = compile_(source.data(), source.size(), cache_name.c_str(), nullptr, nullptr, entry, target,
+                  D3DCOMPILE_SKIP_OPTIMIZATION, 0, code.put(), errors_retry.put());
+  }
+  if (FAILED(hr)) {
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_ERROR("copa renderer: shader {} failed to compile: {}", cache_name,
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_ERROR("wc2010 renderer: shader {} failed to compile: {}", cache_name,
+#else /* street4 */
+    REXLOG_ERROR("street4 renderer: shader {} failed to compile: {}", cache_name,
+#endif /* PORT_GAME */
+                 errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+    std::ofstream(cache_dir_ / (cache_name + ".failed.hlsl")) << source;
+    return false;
+  }
+  out.assign(static_cast<uint8_t*>(code->GetBufferPointer()),
+             static_cast<uint8_t*>(code->GetBufferPointer()) + code->GetBufferSize());
+  if (!cache_name.empty()) {
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
+  }
+  return true;
+}
+
+ShaderEntry* RendererImpl::GetShader(ShaderStage stage, const ShaderMicrocode& code,
+                                     const ShaderKey& key) {
+  RenderPhase profile(RenderProfile::Shader);
+  if ((!code.address && !code.host) || !code.dword_count || code.dword_count > 0x10000) return nullptr;
+  const uint8_t* src = code.host ? code.host : Virtual(code.address);
+  uint64_t hash = Hash64(src, code.dword_count * 4, uint64_t(stage) + 1) ^ (key.Pack() * 0x9E37ull);
+  auto it = shaders_.find(hash);
+  if (it != shaders_.end()) return it->second->failed ? nullptr : it->second.get();
+  auto entry = std::make_unique<ShaderEntry>();
+  std::vector<uint32_t> dwords(code.dword_count);
+  for (uint32_t i = 0; i < code.dword_count; ++i) dwords[i] = LoadBE32(src + i * 4);
+  entry->meta = TranslateShader(stage, dwords.data(), code.dword_count, key);
+  char name[64];
+  snprintf(name, sizeof(name), "%s_%016llx", stage == ShaderStage::kVertex ? "vs" : "ps",
+           static_cast<unsigned long long>(hash));
+  entry->name = name;
+  entry->effect_pass = ea_postfx::Identify(hash);
+  // Diagnostics: <cache>/<name>.override.hlsl replaces the translated source.
+  bool overridden = false;
+  {
+    std::ifstream ov(cache_dir_ / (std::string(name) + ".override.hlsl"));
+    if (ov) {
+      entry->meta.hlsl.assign(std::istreambuf_iterator<char>(ov), {});
+      overridden = true;
+#if PORT_GAME == PORT_GAME_COPA2014
+      REXLOG_INFO("copa renderer: {} uses an override source", name);
+#elif PORT_GAME == PORT_GAME_WC2010
+      REXLOG_INFO("wc2010 renderer: {} uses an override source", name);
+#else /* street4 */
+      REXLOG_INFO("street4 renderer: {} uses an override source", name);
+#endif /* PORT_GAME */
+    }
+  }
+#if PORT_GAME == PORT_GAME_COPA2014
+  if (entry->meta.uses_memexport) REXLOG_WARN("copa renderer: {} uses memexport", name);
+  if (entry->meta.ok && std::getenv("COPA_DUMP_HLSL")) {
+#elif PORT_GAME == PORT_GAME_WC2010
+  if (entry->meta.uses_memexport) REXLOG_WARN("wc2010 renderer: {} uses memexport", name);
+  if (entry->meta.ok && std::getenv("WC2010_DUMP_HLSL")) {
+#else /* street4 */
+  if (entry->meta.uses_memexport) REXLOG_WARN("street4 renderer: {} uses memexport", name);
+  if (entry->meta.ok && std::getenv("STREET4_DUMP_HLSL")) {
+#endif /* PORT_GAME */
+    std::ofstream(cache_dir_ / (std::string(name) + ".hlsl")) << entry->meta.hlsl;
+    std::ofstream bin(cache_dir_ / (std::string(name) + ".ucode"), std::ios::binary);
+    bin.write(reinterpret_cast<const char*>(src), std::streamsize(code.dword_count * 4));
+  }
+  // The bytecode cache is keyed by the generated source too, so translator changes invalidate it.
+  char cache_name[96];
+  snprintf(cache_name, sizeof(cache_name), "%s_%08x", name,
+           static_cast<uint32_t>(Hash64(entry->meta.hlsl.data(), entry->meta.hlsl.size())));
+  std::vector<uint8_t> bytecode;
+  if (!entry->meta.ok ||
+      !Compile(entry->meta.hlsl, "main", stage == ShaderStage::kVertex ? "vs_5_0" : "ps_5_0",
+               bytecode, overridden ? std::string() : std::string(cache_name))) {
+    if (!entry->meta.ok)
+#if PORT_GAME == PORT_GAME_COPA2014
+      REXLOG_ERROR("copa renderer: shader {} translation failed: {}", name, entry->meta.error);
+#elif PORT_GAME == PORT_GAME_WC2010
+      REXLOG_ERROR("wc2010 renderer: shader {} translation failed: {}", name, entry->meta.error);
+#else /* street4 */
+      REXLOG_ERROR("street4 renderer: shader {} translation failed: {}", name, entry->meta.error);
+#endif /* PORT_GAME */
+    entry->failed = true;
+  } else if (stage == ShaderStage::kVertex) {
+    device_->CreateVertexShader(bytecode.data(), bytecode.size(), nullptr, entry->vs.put());
+  } else {
+    device_->CreatePixelShader(bytecode.data(), bytecode.size(), nullptr, entry->ps.put());
+  }
+  auto* raw = entry.get();
+  shaders_[hash] = std::move(entry);
+  return raw->failed ? nullptr : raw;
+}
+
+// --------------------------------------------------------------------------- targets
+#if PORT_GAME == PORT_GAME_COPA2014
+RenderTarget* RendererImpl::GetRenderTarget(bool depth, uint32_t base, uint32_t format,
+                                            uint32_t pitch, uint32_t height) {
+#else /* street4 wc2010 */
+RenderTarget* RendererImpl::GetRenderTarget(const GuestDevice& dev, bool depth, uint32_t base,
+                                            uint32_t format, uint32_t pitch, uint32_t height) {
+#endif /* PORT_GAME */
+  pitch = std::clamp<uint32_t>(pitch, 1, 8192);
+  height = std::clamp<uint32_t>(height, 1, 8192);
+#if PORT_GAME == PORT_GAME_COPA2014
+#else /* street4 wc2010 */
+  // The surface pitch is allocation stride, not the width of the pass. Street 4 keeps a
+  // 1280-pixel pitch for tiny lighting/reduction passes whose results the CPU reads.
+  // Use the guest window extent (or the full tiled scene), and cache native and scaled
+  // versions separately so a previous full-size pass cannot upscale those data passes.
+  uint32_t render_width = tiling_ ? pitch : std::min(pitch, dev.reg(0x2082) & 0x3FFF);
+  float scale = ScaleFor(render_width);
+  const uint32_t samples = SamplesFor(render_width);
+#endif /* PORT_GAME */
+  uint64_t key = uint64_t(base) | (uint64_t(format) << 12) | (uint64_t(pitch) << 20) |
+#if PORT_GAME == PORT_GAME_COPA2014
+                 (uint64_t(depth) << 40);
+#else /* street4 wc2010 */
+                 (uint64_t(depth) << 40) | (uint64_t(scale != 1.0f) << 41) | (uint64_t(samples > 1) << 42);
+#endif /* PORT_GAME */
+  auto& slot = render_targets_[key];
+#if PORT_GAME == PORT_GAME_COPA2014
+  const uint32_t samples = SamplesFor(pitch);
+  if (slot && slot->height >= height && slot->scale == ScaleFor(pitch) && slot->samples == samples) {
+#else /* street4 wc2010 */
+  if (slot && slot->height >= height && slot->scale == scale && slot->samples == samples) {
+#endif /* PORT_GAME */
+    slot->last_used = frame_;
+    return slot.get();
+  }
+  auto rt = std::make_unique<RenderTarget>();
+  rt->edram_base = base;
+  rt->format = format;
+  rt->pitch = pitch;
+  rt->depth = depth;
+  rt->samples = samples;
+  rt->width = pitch;
+  rt->height = std::max(height, slot ? slot->height : 0u);
+  D3D11_TEXTURE2D_DESC td{};
+#if PORT_GAME == PORT_GAME_COPA2014
+  rt->scale = ScaleFor(rt->width);
+#else /* street4 wc2010 */
+  rt->scale = scale;
+#endif /* PORT_GAME */
+  td.Width = ScaledSize(rt->width, rt->scale);
+  td.Height = ScaledSize(rt->height, rt->scale);
+  td.MipLevels = 1;
+  td.ArraySize = 1;
+  td.SampleDesc.Count = rt->samples;
+  td.Usage = D3D11_USAGE_DEFAULT;
+  if (depth) {
+    bool fdepth = format == 1;
+    td.Format = fdepth ? DXGI_FORMAT_R32G8X24_TYPELESS : DXGI_FORMAT_R24G8_TYPELESS;
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    device_->CreateTexture2D(&td, nullptr, rt->texture.put());
+    D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+    dv.Format = fdepth ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dv.ViewDimension = rt->samples > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
+    device_->CreateDepthStencilView(rt->texture.get(), &dv, rt->dsv.put());
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = fdepth ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    sv.ViewDimension = rt->samples > 1 ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D.MipLevels = 1;
+    device_->CreateShaderResourceView(rt->texture.get(), &sv, rt->srv.put());
+    context_->ClearDepthStencilView(rt->dsv.get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+  } else {
+    td.Format = ColorRtFormat(format);
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    device_->CreateTexture2D(&td, nullptr, rt->texture.put());
+    device_->CreateRenderTargetView(rt->texture.get(), nullptr, rt->rtv.put());
+    device_->CreateShaderResourceView(rt->texture.get(), nullptr, rt->srv.put());
+    float zero[4] = {0, 0, 0, 0};
+    context_->ClearRenderTargetView(rt->rtv.get(), zero);
+  }
+  if (!rt->texture) return nullptr;
+  if (slot && slot->texture && slot->scale == rt->scale && slot->samples == rt->samples) {
+    // Keep the old contents when growing.
+    D3D11_BOX box{0, 0, 0, ScaledSize(slot->width, slot->scale), ScaledSize(slot->height, slot->scale), 1};
+    context_->CopySubresourceRegion(rt->texture.get(), 0, 0, 0, 0, slot->texture.get(), 0, &box);
+  }
+  rt->last_used = frame_;
+  slot = std::move(rt);
+  return slot.get();
+}
+
+// --------------------------------------------------------------------------- textures
+ResolvedTexture* RendererImpl::GetResolved(uint32_t address, uint32_t width, uint32_t height,
+                                           uint32_t format, bool create) {
+  auto it = resolved_.find(address);
+  if (it != resolved_.end()) {
+    auto* r = it->second.get();
+#if PORT_GAME == PORT_GAME_COPA2014
+    if (!create || (r->width >= width && r->height >= height &&
+#else /* street4 wc2010 */
+    // Guest addresses are reused by differently sized passes; a native-size resolve must
+    // not inherit a scaled allocation from an earlier scene/post-processing destination.
+    if (!create || (r->width >= width && r->height >= height && r->scale == ScaleFor(width) &&
+#endif /* PORT_GAME */
+                    ResolveDestFormat(r->format) == ResolveDestFormat(format)))
+      return r;
+  }
+  if (!create) return nullptr;
+  auto r = std::make_unique<ResolvedTexture>();
+  r->address = address;
+  r->width = std::clamp<uint32_t>(width, 1, 8192);
+  r->height = std::clamp<uint32_t>(height, 1, 8192);
+  r->format = format;
+  D3D11_TEXTURE2D_DESC td{};
+  r->scale = ScaleFor(r->width);
+  td.Width = ScaledSize(r->width, r->scale);
+  td.Height = ScaledSize(r->height, r->scale);
+  td.MipLevels = 1;
+  td.ArraySize = 1;
+  td.SampleDesc.Count = 1;
+  td.Format = ResolveDestFormat(format);
+  td.Usage = D3D11_USAGE_DEFAULT;
+  td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+  device_->CreateTexture2D(&td, nullptr, r->texture.put());
+  if (!r->texture) return nullptr;
+  device_->CreateRenderTargetView(r->texture.get(), nullptr, r->rtv.put());
+  device_->CreateShaderResourceView(r->texture.get(), nullptr, r->srv.put());
+  auto* raw = r.get();
+  resolved_[address] = std::move(r);
+  return raw;
+}
+
+ID3D11ShaderResourceView* RendererImpl::GetTexture(const uint32_t fetch[6], TextureDimension dim,
+                                                   float size_out[4],
+                                                   ID3D11ShaderResourceView** volume_out) {
+  RenderPhase profile(RenderProfile::Texture);
+  // Type 2 = texture. Type 0 ("invalid texture") constants with a valid address and format
+  // are bound by this game for real textures (screen-space buffers, shadow terms); the GPU
+  // samples them anyway (Xenia: gpu_allow_invalid_fetch_constants), so accept them too.
+  if ((fetch[0] & 3) != 2 && !((fetch[0] & 3) == 0 && (fetch[1] & ~0xFFFu))) {
+    if (TraceFrame(frame_))
+      REXLOG_INFO("trace texture null (fetch type): {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} req_dim={}", fetch[0],
+                  fetch[1], fetch[2], fetch[3], fetch[4], fetch[5], int(dim));
+    return nullptr;
+  }
+  TextureDesc desc = TextureDescFromFetch(fetch);
+  size_out[0] = float(desc.width);
+  size_out[1] = float(desc.height);
+  size_out[2] = float(desc.depth);
+  size_out[3] = 0.0f;
+#if PORT_GAME == PORT_GAME_COPA2014
+  // Diagnostics: COPA_WHITE_TEX=<hex address> binds a white texture in its place.
+#elif PORT_GAME == PORT_GAME_WC2010
+  // Diagnostics: WC2010_WHITE_TEX=<hex address> binds a white texture in its place.
+#else /* street4 */
+  // Diagnostics: STREET4_WHITE_TEX=<hex address> binds a white texture in its place.
+#endif /* PORT_GAME */
+  static const uint32_t white_address = [] {
+#if PORT_GAME == PORT_GAME_COPA2014
+    const char* e = std::getenv("COPA_WHITE_TEX");
+#elif PORT_GAME == PORT_GAME_WC2010
+    const char* e = std::getenv("WC2010_WHITE_TEX");
+#else /* street4 */
+    const char* e = std::getenv("STREET4_WHITE_TEX");
+#endif /* PORT_GAME */
+    return e ? uint32_t(std::strtoul(e, nullptr, 16)) : 0u;
+  }();
+  if (white_address && desc.base_address == white_address) {
+    static Com<ID3D11ShaderResourceView> white2d, white_array;
+    if (!white2d) {
+      uint32_t px = 0xFFFFFFFFu;
+      D3D11_TEXTURE2D_DESC td{1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_IMMUTABLE,
+                              D3D11_BIND_SHADER_RESOURCE, 0, 0};
+      D3D11_SUBRESOURCE_DATA init{&px, 4, 4};
+      Com<ID3D11Texture2D> t;
+      device_->CreateTexture2D(&td, &init, t.put());
+      device_->CreateShaderResourceView(t.get(), nullptr, white2d.put());
+      D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+      sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+      sv.Texture2DArray.MipLevels = 1;
+      sv.Texture2DArray.ArraySize = 1;
+      device_->CreateShaderResourceView(t.get(), &sv, white_array.put());
+    }
+    return (dim == TextureDimension::k3D || dim == TextureDimension::kStacked) ? white_array.get()
+                                                                               : white2d.get();
+  }
+  // Render-to-texture results first.
+  if (desc.base_address) {
+    if (auto* r = GetResolved(desc.base_address, 0, 0, 0, false)) {
+      // Valid while the CPU has not rewritten the guest memory there.
+      uint32_t sample = std::min<uint32_t>(4096, desc.width * desc.height);
+      uint64_t h = writebacks_by_address_.count(desc.base_address & 0x1FFFFFFF)
+                       ? r->guest_hash
+                       : Hash64(Physical(desc.base_address), sample);
+      if (h != r->guest_hash && sample == 4096 && OnDemandStored(desc.base_address & 0x1FFFFFFF, h))
+        r->guest_hash = h;
+      if (h == r->guest_hash && (dim == TextureDimension::k2D || dim == TextureDimension::k1D))
+        return r->srv.get();
+#if PORT_GAME == PORT_GAME_COPA2014
+      if (h != r->guest_hash) {
+        static int logs = 0;
+        if (glitch_log_enabled_ && sample == 4096 && logs++ < 300)
+          REXLOG_INFO("copa resolved texture dropped (guest memory changed): {:08X} frame {} fmt={} {}x{} resolved in frame {}",
+                      desc.base_address, frame_, desc.format, desc.width, desc.height, r->frame);
+        resolved_.erase(desc.base_address);
+      }
+#else /* street4 wc2010 */
+      if (h != r->guest_hash) resolved_.erase(desc.base_address);
+#endif /* PORT_GAME */
+    }
+  }
+  uint64_t key = Hash64(&desc, sizeof(desc));
+  auto& slot = textures_[key];
+#if PORT_GAME == PORT_GAME_COPA2014
+  static const bool compare_textures = !std::getenv("COPA_NO_TEXTURE_COMPARE");
+#elif PORT_GAME == PORT_GAME_WC2010
+  static const bool compare_textures = !std::getenv("WC2010_NO_TEXTURE_COMPARE");
+#else /* street4 */
+  static const bool compare_textures = !std::getenv("STREET4_NO_TEXTURE_COMPARE");
+#endif /* PORT_GAME */
+  const uint32_t extent = GuestBaseExtentBytes(desc);
+  const uint32_t source_address = desc.base_address ? desc.base_address : desc.mip_address;
+  const bool exact_compare = compare_textures && extent &&
+                            (source_address & 0x1FFFFFFF) + extent <= 0x20000000u;
+  // Compare precisely the bytes covered by the original validator: whole small
+  // textures, the same 64 x 512-byte spans for large textures. No hash collisions,
+  // no reduced coverage or delayed invalidation. Snapshots are evicted with the SRV.
+#if PORT_GAME == PORT_GAME_WC2010
+  // Whole textures up to 1 MB are compared byte for byte (was 256 KB): the UI font's glyph cache
+  // texture is rewritten a few glyphs at a time, and the 64 x 512-byte samples of a larger texture
+  // missed them ("hecline", "S EECH" in the menus, 06/11).
+  static constexpr uint32_t kFullCompareBytes = 1024 * 1024;
+  const uint32_t validation_size = extent <= kFullCompareBytes ? extent : 64 * 512;
+#else /* street4 copa2014 */
+  const uint32_t validation_size = extent <= 256 * 1024 ? extent : 64 * 512;
+#endif /* PORT_GAME */
+  auto same_texture_bytes = [&](const std::vector<uint8_t>& previous) {
+    if (previous.size() != validation_size) return false;
+#if PORT_GAME == PORT_GAME_WC2010
+    if (extent <= kFullCompareBytes)
+#else /* street4 copa2014 */
+    if (extent <= 256 * 1024)
+#endif /* PORT_GAME */
+      return std::memcmp(previous.data(), Physical(source_address), extent) == 0;
+    for (uint32_t i = 0; i < 64; ++i) {
+      uint32_t off = uint32_t(uint64_t(extent - 512) * i / 63);
+      if (std::memcmp(previous.data() + i * 512, Physical(source_address + off), 512)) return false;
+    }
+    return true;
+  };
+  auto sample_hash = [&]() {
+    uint32_t extent = GuestBaseExtentBytes(desc);
+    uint32_t addr = desc.base_address ? desc.base_address : desc.mip_address;
+    if (!extent || (addr & 0x1FFFFFFF) + extent > 0x20000000u) return uint64_t(0);
+    // Full hash for small textures, strided samples for large ones.
+#if PORT_GAME == PORT_GAME_WC2010
+    if (extent <= kFullCompareBytes) return Hash64(Physical(addr), extent);
+#else /* street4 copa2014 */
+    if (extent <= 256 * 1024) return Hash64(Physical(addr), extent);
+#endif /* PORT_GAME */
+    uint64_t h = 0;
+    for (uint32_t i = 0; i < 64; ++i) {
+      uint32_t off = uint32_t(uint64_t(extent - 512) * i / 63);
+      h = Hash64(Physical(addr + off), 512, h);
+    }
+    return h;
+  };
+#if PORT_GAME == PORT_GAME_WC2010
+  // Also revalidate within a frame once the CPU wrote the watched pages: glyphs are added to the
+  // cache texture between draws of the same frame.
+  if (slot && (slot->validated_frame != frame_ ||
+               (slot->watch.armed && WriteGen(source_address, extent) != slot->watch.gen))) {
+#else /* street4 copa2014 */
+  if (slot && slot->validated_frame != frame_) {
+#endif /* PORT_GAME */
+    bool changed = ValidateWatched(slot->watch, source_address, extent, "texture", [&] {
+      return exact_compare ? !same_texture_bytes(slot->validation_bytes) : sample_hash() != slot->sample_hash;
+    });
+    if (changed) slot.reset();
+    else slot->validated_frame = frame_;
+    texture_reloaded_ = changed;
+  } else {
+    texture_reloaded_ = false;
+  }
+  const auto load_start = std::chrono::steady_clock::now();
+  struct SlowLoadLog {
+    RendererImpl* self; const TextureDesc& desc; std::chrono::steady_clock::time_point start; bool armed = false;
+    ~SlowLoadLog() {
+      if (!armed || !RenderProfile::Get().enabled) return;
+      double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      if (ms > 1)
+#if PORT_GAME == PORT_GAME_COPA2014
+        REXLOG_INFO("copa slow texture load #{} {:.2f} ms: addr={:08X} fmt={} {}x{}x{} dim={} reloaded={}",
+#elif PORT_GAME == PORT_GAME_WC2010
+        REXLOG_INFO("wc2010 slow texture load #{} {:.2f} ms: addr={:08X} fmt={} {}x{}x{} dim={} reloaded={}",
+#else /* street4 */
+        REXLOG_INFO("street4 slow texture load #{} {:.2f} ms: addr={:08X} fmt={} {}x{}x{} dim={} reloaded={}",
+#endif /* PORT_GAME */
+                    self->frame_, ms, desc.base_address, desc.format, desc.width, desc.height, desc.depth,
+                    desc.dimension, self->texture_reloaded_);
+    }
+  } slow_load{this, desc, load_start, !slot};
+  auto trace_null = [&](const char* why) {
+    if (TraceFrame(frame_))
+      REXLOG_INFO("trace texture null ({}): addr={:08X} fmt={} {}x{}x{} dim={} req_dim={} tiled={} packed={}", why,
+                  desc.base_address, desc.format, desc.width, desc.height, desc.depth, desc.dimension, int(dim),
+                  desc.tiled, desc.packed_mips);
+  };
+  if (!slot) {
+    LoadedTexture loaded;
+    if (!LoadTexture(desc, [this](uint32_t a) -> const uint8_t* { return Physical(a); }, loaded)) {
+      trace_null("load failed");
+      return nullptr;
+    }
+    auto t = std::make_unique<HostTexture>();
+    t->desc = desc;
+    t->cube = desc.dimension == 3;
+    t->array_size = loaded.array_size;
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = loaded.width;
+    td.Height = loaded.height;
+    td.MipLevels = loaded.mip_levels;
+    td.ArraySize = loaded.array_size;
+    td.SampleDesc.Count = 1;
+    td.Format = loaded.format.dxgi;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    td.MiscFlags = t->cube && loaded.array_size == 6 ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
+    bool block = loaded.format.block_width > 1;
+    if (block) {
+      // Block-compressed resources need dimensions that are multiples of 4 at level 0.
+      td.Width = std::max<UINT>(td.Width, 1);
+      td.Height = std::max<UINT>(td.Height, 1);
+    }
+    std::vector<D3D11_SUBRESOURCE_DATA> init(loaded.subresources.size());
+    for (size_t i = 0; i < init.size(); ++i) {
+      init[i].pSysMem = loaded.subresources[i].data.data();
+      init[i].SysMemPitch = loaded.subresources[i].row_pitch;
+      init[i].SysMemSlicePitch = loaded.subresources[i].slice_pitch;
+    }
+    static int texture_logs = 0;
+    if (texture_logs++ < 60)
+#if PORT_GAME == PORT_GAME_COPA2014
+      REXLOG_INFO("copa texture: addr={:08X} mip={:08X} fmt={} {}x{}x{} dim={} tiled={} pitch={} "
+#elif PORT_GAME == PORT_GAME_WC2010
+      REXLOG_INFO("wc2010 texture: addr={:08X} mip={:08X} fmt={} {}x{}x{} dim={} tiled={} pitch={} "
+#else /* street4 */
+      REXLOG_INFO("street4 texture: addr={:08X} mip={:08X} fmt={} {}x{}x{} dim={} tiled={} pitch={} "
+#endif /* PORT_GAME */
+                  "endian={} levels={} packed={} dxgi={}",
+                  desc.base_address, desc.mip_address, desc.format, desc.width, desc.height,
+                  desc.depth, desc.dimension, desc.tiled, desc.pitch_div32 * 32, desc.endian,
+                  loaded.mip_levels, desc.packed_mips, int(loaded.format.dxgi));
+    if (FAILED(device_->CreateTexture2D(&td, init.data(), t->texture.put()))) {
+#if PORT_GAME == PORT_GAME_COPA2014
+      REXLOG_ERROR("copa texture: CreateTexture2D failed for fmt {} {}x{}", desc.format,
+#elif PORT_GAME == PORT_GAME_WC2010
+      REXLOG_ERROR("wc2010 texture: CreateTexture2D failed for fmt {} {}x{}", desc.format,
+#else /* street4 */
+      REXLOG_ERROR("street4 texture: CreateTexture2D failed for fmt {} {}x{}", desc.format,
+#endif /* PORT_GAME */
+                   td.Width, td.Height);
+      return nullptr;
+    }
+    if (desc.dimension == 2) {
+      // The depth slices of the base level, contiguous, as a volume.
+      const auto& first = loaded.subresources[0];
+      std::vector<uint8_t> voxels;
+      voxels.reserve(size_t(first.slice_pitch) * loaded.array_size);
+      for (uint32_t z = 0; z < loaded.array_size; ++z) {
+        const auto& sub = loaded.subresources[size_t(z) * loaded.mip_levels];
+        voxels.insert(voxels.end(), sub.data.begin(), sub.data.end());
+      }
+      D3D11_TEXTURE3D_DESC vd{};
+      vd.Width = loaded.width;
+      vd.Height = loaded.height;
+      vd.Depth = loaded.array_size;
+      vd.MipLevels = 1;
+      vd.Format = loaded.format.dxgi;
+      vd.Usage = D3D11_USAGE_IMMUTABLE;
+      vd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      D3D11_SUBRESOURCE_DATA vi{voxels.data(), first.row_pitch, first.slice_pitch};
+      if (SUCCEEDED(device_->CreateTexture3D(&vd, &vi, t->volume.put())))
+        device_->CreateShaderResourceView(t->volume.get(), nullptr, t->srv_volume.put());
+    }
+    if (exact_compare) {
+      t->validation_bytes.resize(validation_size);
+#if PORT_GAME == PORT_GAME_WC2010
+      if (extent <= kFullCompareBytes)
+#else /* street4 copa2014 */
+      if (extent <= 256 * 1024)
+#endif /* PORT_GAME */
+        std::memcpy(t->validation_bytes.data(), Physical(source_address), extent);
+      else for (uint32_t i = 0; i < 64; ++i) {
+        uint32_t off = uint32_t(uint64_t(extent - 512) * i / 63);
+        std::memcpy(t->validation_bytes.data() + i * 512, Physical(source_address + off), 512);
+      }
+    } else t->sample_hash = sample_hash();
+    t->validated_frame = frame_;
+    slot = std::move(t);
+  }
+  slot->last_used = frame_;
+  auto* t = slot.get();
+  if (volume_out) *volume_out = t->srv_volume.get();
+  D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+  D3D11_TEXTURE2D_DESC td;
+  t->texture->GetDesc(&td);
+  sv.Format = td.Format;
+  switch (dim) {
+    case TextureDimension::kCube:
+      if (!t->cube) {
+        trace_null("not a cube");
+        return nullptr;
+      }
+      if (!t->srv_cube) {
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+        sv.TextureCube.MipLevels = td.MipLevels;
+        device_->CreateShaderResourceView(t->texture.get(), &sv, t->srv_cube.put());
+      }
+      return t->srv_cube.get();
+    case TextureDimension::k3D:
+    case TextureDimension::kStacked:
+      if (!t->srv_array) {
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        sv.Texture2DArray.MipLevels = td.MipLevels;
+        sv.Texture2DArray.ArraySize = td.ArraySize;
+        device_->CreateShaderResourceView(t->texture.get(), &sv, t->srv_array.put());
+      }
+      return t->srv_array.get();
+    default:
+      if (td.ArraySize != 1) {
+        trace_null("array as 2D");
+        return nullptr;
+      }
+      if (!t->srv2d) {
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = td.MipLevels;
+        device_->CreateShaderResourceView(t->texture.get(), &sv, t->srv2d.put());
+      }
+      return t->srv2d.get();
+  }
+}
+
+ID3D11SamplerState* RendererImpl::GetSampler(const uint32_t f[6]) {
+  uint32_t clamp_x = (f[0] >> 10) & 7, clamp_y = (f[0] >> 13) & 7, clamp_z = (f[0] >> 16) & 7;
+  uint32_t mag = (f[3] >> 19) & 3, min = (f[3] >> 21) & 3, mip = (f[3] >> 23) & 3;
+  uint32_t aniso = (f[3] >> 25) & 7;
+  uint32_t border = f[5] & 3;
+  // PC settings: anisotropic filtering forced on filtered (linear mip) fetches.
+  int forced_aniso = pcs::Anisotropy();
+  if (forced_aniso > 1 && min == 1 && mag == 1 && mip == 1)
+    aniso = std::max<uint32_t>(aniso == 7 ? 0 : aniso, uint32_t(std::countr_zero(unsigned(forced_aniso))) + 1);
+  int32_t lod_bias = int32_t(f[4] << 10) >> 22;  // bits 12-21
+  uint32_t mip_min = (f[4] >> 2) & 15, mip_max = (f[4] >> 6) & 15;
+  uint64_t key = uint64_t(clamp_x) | (uint64_t(clamp_y) << 3) | (uint64_t(clamp_z) << 6) |
+                 (uint64_t(mag) << 9) | (uint64_t(min) << 11) | (uint64_t(mip) << 13) |
+                 (uint64_t(aniso) << 15) | (uint64_t(border) << 18) |
+                 (uint64_t(uint32_t(lod_bias) & 0x3FF) << 20) | (uint64_t(mip_min) << 30) |
+                 (uint64_t(mip_max) << 34);
+  auto& s = samplers_[key];
+  if (!s) {
+    D3D11_SAMPLER_DESC d{};
+    bool lmag = mag == 1, lmin = min == 1, lmip = mip == 1;
+    if (aniso > 1 && aniso != 7) {
+      d.Filter = D3D11_FILTER_ANISOTROPIC;
+      d.MaxAnisotropy = 1u << (aniso - 1);
+    } else {
+      d.Filter = D3D11_ENCODE_BASIC_FILTER(lmin ? D3D11_FILTER_TYPE_LINEAR : D3D11_FILTER_TYPE_POINT,
+                                           lmag ? D3D11_FILTER_TYPE_LINEAR : D3D11_FILTER_TYPE_POINT,
+                                           lmip ? D3D11_FILTER_TYPE_LINEAR : D3D11_FILTER_TYPE_POINT,
+                                           D3D11_FILTER_REDUCTION_TYPE_STANDARD);
+    }
+    d.AddressU = AddressMode(clamp_x);
+    d.AddressV = AddressMode(clamp_y);
+    d.AddressW = AddressMode(clamp_z);
+    d.MipLODBias = float(lod_bias) / 32.0f;
+    d.MinLOD = 0.0f;  // the host texture starts at the fetch constant's first stored level
+    d.MaxLOD = mip == 2 ? 0.0f : D3D11_FLOAT32_MAX;
+    float b = border == 1 ? 1.0f : 0.0f;
+    d.BorderColor[0] = d.BorderColor[1] = d.BorderColor[2] = b;
+    d.BorderColor[3] = border == 1 ? 1.0f : 0.0f;
+    d.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    device_->CreateSamplerState(&d, s.put());
+  }
+  return s.get();
+}
+
+// --------------------------------------------------------------------------- buffers
+void RendererImpl::UpdateDynamicBuffer(Com<ID3D11Buffer>& buffer, uint32_t& capacity, UINT bind,
+                                       const void* data, uint32_t bytes) {
+  if (!buffer || capacity < bytes) {
+    capacity = std::max<uint32_t>(bytes, 64 * 1024);
+    capacity = (capacity + 0xFFFF) & ~0xFFFFu;
+    D3D11_BUFFER_DESC d{};
+    d.ByteWidth = capacity;
+    d.Usage = D3D11_USAGE_DYNAMIC;
+    d.BindFlags = bind;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (bind == D3D11_BIND_SHADER_RESOURCE) d.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+    device_->CreateBuffer(&d, nullptr, buffer.put());
+  }
+  D3D11_MAPPED_SUBRESOURCE m;
+  if (SUCCEEDED(context_->Map(buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+    std::memcpy(m.pData, data, bytes);
+    context_->Unmap(buffer.get(), 0);
+  }
+}
+
+// --------------------------------------------------------------------------- write watch
+std::pair<uint32_t, uint32_t> RendererImpl::OnInvalidate(void* context, uint32_t start, uint32_t length, bool) {
+  auto* self = static_cast<RendererImpl*>(context);
+  const uint32_t first = start >> kWatchPageShift;
+  const uint32_t last =
+      uint32_t(std::min<uint64_t>((uint64_t(start) + length + (1u << kWatchPageShift) - 1) >> kWatchPageShift, kWatchPages));
+  for (uint32_t p = first; p < last; ++p) self->write_gen_[p].fetch_add(1, std::memory_order_relaxed);
+  // Only the touched pages may be unprotected: (0, UINT32_MAX) would drop every other watch.
+  return {first << kWatchPageShift, (last - first) << kWatchPageShift};
+}
+
+uint64_t RendererImpl::WriteGen(uint32_t address, uint32_t size) const {
+  const uint32_t start = address & 0x1FFFFFFF;
+  const uint32_t first = start >> kWatchPageShift;
+  const uint32_t last =
+      uint32_t(std::min<uint64_t>((uint64_t(start) + size + (1u << kWatchPageShift) - 1) >> kWatchPageShift, kWatchPages));
+  uint64_t sum = 0;
+  for (uint32_t p = first; p < last; ++p) sum += write_gen_[p].load(std::memory_order_relaxed);
+  return sum;
+}
+
+// Validates a cached copy of guest memory; changed_fn compares the bytes. A copy that stayed
+// unchanged for a while gets its pages write-protected, and until the CPU writes there again
+// the comparison is skipped. The pages are protected before the generation is read and the
+// bytes compared, so a write racing the comparison still bumps the generation. Copies whose
+// pages the CPU rewrites without changing them (same bytes, or neighbours on the same pages)
+// back off before being protected again.
+template <typename F>
+bool RendererImpl::ValidateWatched(WriteWatchState& w, uint32_t address, uint32_t size, const char* what,
+                                   F&& changed_fn) {
+  if (w.armed && WriteGen(address, size) == w.gen) {
+    if (!write_watch_check_ || !changed_fn()) return false;
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_WARN("copa write watch MISS #{}: {} {:08X} ({} bytes)", ++watch_misses_, what, address, size);
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_WARN("wc2010 write watch MISS #{}: {} {:08X} ({} bytes)", ++watch_misses_, what, address, size);
+#else /* street4 */
+    REXLOG_WARN("street4 write watch MISS #{}: {} {:08X} ({} bytes)", ++watch_misses_, what, address, size);
+#endif /* PORT_GAME */
+    w.armed = false;
+    return true;
+  }
+  const bool arm = write_watch_ && size && !w.armed && w.quiet + 1 >= w.need;
+  if (arm) memory_->EnablePhysicalMemoryAccessCallbacks(address & 0x1FFFFFFF, size, true, false);
+  const uint64_t gen = arm ? WriteGen(address, size) : 0;
+  const bool changed = changed_fn();
+  if (changed) {
+    w.quiet = 0;
+    w.armed = false;
+  } else if (w.armed) {
+    w.need = std::min<uint32_t>(w.need * 2, 64);
+    w.quiet = 0;
+    w.armed = false;
+  } else {
+    ++w.quiet;
+    w.armed = arm;
+    w.gen = gen;
+  }
+  return changed;
+}
+
+ID3D11ShaderResourceView* RendererImpl::GetVertexBuffer(uint32_t physical, uint32_t bytes,
+                                                        bool cacheable, const uint8_t* host) {
+  RenderPhase profile(RenderProfile::Vertex);
+  bytes = std::min<uint32_t>((bytes + 15) & ~15u, 64u << 20);
+  if (!bytes) bytes = 16;
+  auto fill = [&](VertexBufferEntry& e) {
+    UINT old_capacity = e.capacity;
+    UpdateDynamicBuffer(e.buffer, e.capacity, D3D11_BIND_SHADER_RESOURCE, host, bytes);
+    if (!e.srv || old_capacity != e.capacity) {
+      D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+      sv.Format = DXGI_FORMAT_R32_TYPELESS;
+      sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+      sv.BufferEx.NumElements = e.capacity / 4;
+      sv.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+      device_->CreateShaderResourceView(e.buffer.get(), &sv, e.srv.put());
+    }
+  };
+  if (!cacheable) {
+    if (transient_next_ >= transient_vbs_.size())
+      transient_vbs_.push_back(std::make_unique<VertexBufferEntry>());
+    auto& e = *transient_vbs_[transient_next_++];
+    fill(e);
+    return e.srv.get();
+  }
+  uint64_t key = uint64_t(physical) | (uint64_t(bytes) << 32);
+  auto& slot = vertex_buffers_[key];
+  if (!slot) slot = std::make_unique<VertexBufferEntry>();
+  auto& e = *slot;
+  e.last_used = frame_;
+#if PORT_GAME == PORT_GAME_COPA2014
+  // Dynamic geometry may reuse the same guest allocation between draws.
+  // A frame number isn't a content version.
+  static const bool compare_vertices = !std::getenv("COPA_NO_VERTEX_COMPARE");
+  // Byte-exact comparison (cheaper than hashing, no collisions), skipped while the write watch
+  // shows the guest pages untouched.
+#elif PORT_GAME == PORT_GAME_WC2010
+  if (e.validated_frame == frame_ && e.srv) return e.srv.get();
+  static const bool compare_vertices = !std::getenv("WC2010_NO_VERTEX_COMPARE");
+#else /* street4 */
+  if (e.validated_frame == frame_ && e.srv) return e.srv.get();
+  static const bool compare_vertices = !std::getenv("STREET4_NO_VERTEX_COMPARE");
+#endif /* PORT_GAME */
+  const bool exact = compare_vertices && bytes <= 1024 * 1024;
+  const bool changed = !e.srv || ValidateWatched(e.watch, physical, bytes, "vertices", [&] {
+    return exact ? e.validation_bytes.size() != bytes || std::memcmp(e.validation_bytes.data(), host, bytes) != 0
+                 : Hash64(host, bytes) != e.hash;
+  });
+  if (changed) {
+    fill(e);
+    if (exact) e.validation_bytes.assign(host, host + bytes);
+    else e.hash = Hash64(host, bytes);
+  }
+  e.validated_frame = frame_;
+  return e.srv.get();
+}
+
+// --------------------------------------------------------------------------- primitives
+bool RendererImpl::BuildIndices(const DrawRequest& draw, D3D11_PRIMITIVE_TOPOLOGY& topology,
+                                std::vector<uint32_t>& out, bool& use_indices, bool& rect_list,
+                                const GuestDevice& dev) {
+  RenderPhase profile(RenderProfile::Indices);
+  out.clear();
+  rect_list = false;
+  cached_ib_ = nullptr;
+  uint32_t n = draw.count;
+  if (!n) return false;
+#if PORT_GAME == PORT_GAME_COPA2014
+  static const bool direct_draw = !std::getenv("COPA_NO_DIRECT_DRAW");
+#elif PORT_GAME == PORT_GAME_WC2010
+  static const bool direct_draw = !std::getenv("WC2010_NO_DIRECT_DRAW");
+#else /* street4 */
+  static const bool direct_draw = !std::getenv("STREET4_NO_DIRECT_DRAW");
+#endif /* PORT_GAME */
+  if (direct_draw && !draw.indexed) {
+    switch (draw.primitive) {
+      case 1: topology = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST; break;
+      case 2: topology = D3D11_PRIMITIVE_TOPOLOGY_LINELIST; break;
+      case 3: topology = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP; break;
+      case 4: topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST; break;
+      case 6: topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP; break;
+      default: goto converted_indices;
+    }
+    use_indices = false;
+    return true;
+  }
+converted_indices:
+  std::vector<uint32_t>& src = index_scratch_;
+  src.resize(n);
+  bool reset_enabled = (dev.reg(0x2205) >> 21) & 1;  // PA_SU_SC_MODE_CNTL.multi_prim_ib_ena
+  uint32_t reset_index = dev.reg(0x2103) & 0xFFFFFF;
+  // Indexed lists/strips: the converted buffer is cached per guest range, base vertex and reset
+#if PORT_GAME == PORT_GAME_COPA2014
+  // index, revalidated against the guest bytes (write watch). COPA_NO_INDEX_CACHE=1: convert
+#elif PORT_GAME == PORT_GAME_WC2010
+  // index, revalidated against the guest bytes (write watch). WC2010_NO_INDEX_CACHE=1: convert
+#else /* street4 */
+  // index, revalidated against the guest bytes (write watch). STREET4_NO_INDEX_CACHE=1: convert
+#endif /* PORT_GAME */
+  // and upload on every draw as before.
+#if PORT_GAME == PORT_GAME_COPA2014
+  static const bool cache_indices = direct_draw && !std::getenv("COPA_NO_INDEX_CACHE");
+#elif PORT_GAME == PORT_GAME_WC2010
+  static const bool cache_indices = direct_draw && !std::getenv("WC2010_NO_INDEX_CACHE");
+#else /* street4 */
+  static const bool cache_indices = direct_draw && !std::getenv("STREET4_NO_INDEX_CACHE");
+#endif /* PORT_GAME */
+  const bool direct_topology = draw.primitive == 1 || draw.primitive == 2 || draw.primitive == 3 ||
+                               draw.primitive == 4 || draw.primitive == 6;
+  if (cache_indices && draw.indexed && direct_topology && n <= (1u << 20)) {
+    if (!ValidGuest(draw.index_address)) return false;
+    const uint8_t* p = Virtual(draw.index_address);
+    const uint32_t bytes = n * (draw.index32 ? 4 : 2);
+    const uint32_t physical = VirtualToPhysical(draw.index_address);
+    const uint64_t params[] = {physical, n, uint64_t(draw.index32) | uint64_t(reset_enabled) << 1,
+                               reset_index, uint64_t(uint32_t(draw.base_vertex))};
+    auto& slot = index_buffers_[Hash64(params, sizeof(params))];
+    if (!slot) slot = std::make_unique<IndexBufferEntry>();
+    auto& e = *slot;
+    e.last_used = frame_;
+    const bool changed = !e.buffer || e.raw.size() != bytes ||
+                         ValidateWatched(e.watch, physical, bytes, "indices",
+                                         [&] { return std::memcmp(e.raw.data(), p, bytes) != 0; });
+    if (changed) {
+      for (uint32_t i = 0; i < n; ++i) {
+        uint32_t v = draw.index32 ? LoadBE32(p + i * 4) : LoadBE16(p + i * 2);
+        bool is_reset = reset_enabled && (draw.index32 ? (v & 0xFFFFFF) == reset_index
+                                                       : v == (reset_index & 0xFFFF));
+        src[i] = is_reset ? 0xFFFFFFFFu : uint32_t(int32_t(v) + draw.base_vertex);
+      }
+      if (e.buffer && e.raw.size() == bytes) {
+        context_->UpdateSubresource(e.buffer.get(), 0, nullptr, src.data(), 0, 0);
+      } else {
+        D3D11_BUFFER_DESC d{};
+        d.ByteWidth = n * 4;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA init{src.data(), 0, 0};
+        if (FAILED(device_->CreateBuffer(&d, &init, e.buffer.put()))) return false;
+      }
+      e.raw.assign(p, p + bytes);
+    }
+    switch (draw.primitive) {
+      case 1: topology = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST; break;
+      case 2: topology = D3D11_PRIMITIVE_TOPOLOGY_LINELIST; break;
+      case 3: topology = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP; break;
+      case 4: topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST; break;
+      default: topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP; break;
+    }
+    cached_ib_ = e.buffer.get();
+    cached_index_count_ = n;
+    use_indices = true;
+    return true;
+  }
+  if (draw.indexed) {
+    if (!ValidGuest(draw.index_address)) return false;
+    const uint8_t* p = Virtual(draw.index_address);
+    for (uint32_t i = 0; i < n; ++i) {
+      uint32_t v = draw.index32 ? LoadBE32(p + i * 4) : LoadBE16(p + i * 2);
+      bool is_reset = reset_enabled && (draw.index32 ? (v & 0xFFFFFF) == reset_index
+                                                     : v == (reset_index & 0xFFFF));
+      src[i] = is_reset ? 0xFFFFFFFFu : uint32_t(int32_t(v) + draw.base_vertex);
+    }
+  } else {
+    for (uint32_t i = 0; i < n; ++i) src[i] = draw.first_vertex + i;
+  }
+  use_indices = true;
+  switch (draw.primitive) {
+    case 1: topology = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST; out = src; break;
+    case 2: topology = D3D11_PRIMITIVE_TOPOLOGY_LINELIST; out = src; break;
+    case 3: topology = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP; out = src; break;
+    case 4: topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST; out = src; break;
+    case 6: topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP; out = src; break;
+    case 5: case 15: {  // fan / polygon
+      topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+      uint32_t first = 0;
+      for (uint32_t i = 0; i < n; ++i) {
+        if (src[i] == 0xFFFFFFFFu) { first = i + 1; continue; }
+        if (i >= first + 2) {
+          out.push_back(src[first]);
+          out.push_back(src[i - 1]);
+          out.push_back(src[i]);
+        }
+      }
+      break;
+    }
+    case 8:  // rectangle list: 3 vertices each, expanded by the geometry shader
+      topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+      out = src;
+      out.resize(n / 3 * 3);
+      rect_list = true;
+      break;
+    case 12:  // line loop
+      topology = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
+      out = src;
+      out.push_back(src[0]);
+      break;
+    case 13:  // quad list
+      topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+      for (uint32_t i = 0; i + 3 < n; i += 4) {
+        uint32_t q[6] = {src[i], src[i + 1], src[i + 2], src[i], src[i + 2], src[i + 3]};
+        out.insert(out.end(), q, q + 6);
+      }
+      break;
+    case 14:  // quad strip
+      topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+      for (uint32_t i = 0; i + 3 < n; i += 2) {
+        uint32_t q[6] = {src[i], src[i + 1], src[i + 3], src[i], src[i + 3], src[i + 2]};
+        out.insert(out.end(), q, q + 6);
+      }
+      break;
+    default:
+      return false;
+  }
+  return !out.empty();
+}
+
+// --------------------------------------------------------------------------- states
+void RendererImpl::SetupStates(const GuestDevice& dev, uint32_t color_mask_active,
+                               bool depth_active) {
+  // Blend.
+  uint32_t color_mask = dev.reg(0x2104);
+  uint32_t blend[4] = {dev.reg(0x2201), dev.reg(0x2209), dev.reg(0x220A), dev.reg(0x220B)};
+  uint32_t colorcontrol = dev.reg(0x2202);
+  bool a2c = (colorcontrol >> 4) & 1;
+  uint64_t bkey = Hash64(blend, sizeof(blend)) ^ (uint64_t(color_mask & color_mask_active) << 1) ^
+                  uint64_t(a2c);
+  auto& bs = blend_states_[bkey];
+  if (!bs) {
+    D3D11_BLEND_DESC d{};
+    d.AlphaToCoverageEnable = a2c;
+    d.IndependentBlendEnable = TRUE;
+    for (int i = 0; i < 4; ++i) {
+      auto& rt = d.RenderTarget[i];
+      uint32_t b = blend[i];
+      uint32_t cs = b & 31, cop = (b >> 5) & 7, cd = (b >> 8) & 31;
+      uint32_t as = (b >> 16) & 31, aop = (b >> 21) & 7, ad = (b >> 24) & 31;
+      rt.BlendEnable = !(cs == 1 && cd == 0 && cop == 0 && as == 1 && ad == 0 && aop == 0);
+      rt.SrcBlend = BlendFactor(cs, false);
+      rt.DestBlend = BlendFactor(cd, false);
+      rt.BlendOp = BlendOp(cop);
+      rt.SrcBlendAlpha = BlendFactor(as, true);
+      rt.DestBlendAlpha = BlendFactor(ad, true);
+      rt.BlendOpAlpha = BlendOp(aop);
+      rt.RenderTargetWriteMask = UINT8((color_mask & color_mask_active) >> (4 * i)) & 0xF;
+    }
+    device_->CreateBlendState(&d, bs.put());
+  }
+  float blend_factor[4] = {dev.reg_float(0x2105), dev.reg_float(0x2106), dev.reg_float(0x2107),
+                           dev.reg_float(0x2108)};
+  context_->OMSetBlendState(bs.get(), blend_factor, 0xFFFFFFFF);
+
+  // Depth / stencil.
+  uint32_t dc = dev.reg(0x2200);
+  uint32_t ref_front = dev.reg(0x210D), ref_back = dev.reg(0x210C);
+  uint64_t dkey = uint64_t(dc) | (uint64_t(ref_front & 0xFFFF00) << 32) |
+                  (uint64_t(depth_active) << 63);
+  dkey ^= uint64_t(ref_back & 0xFFFF00) << 8;
+  auto& ds = depth_states_[dkey];
+  if (!ds) {
+    D3D11_DEPTH_STENCIL_DESC d{};
+    d.DepthEnable = depth_active && ((dc >> 1) & 1);
+    d.DepthWriteMask = ((dc >> 2) & 1) ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+    d.DepthFunc = CompareFunc(dc >> 4);
+#if PORT_GAME == PORT_GAME_COPA2014
+    static const bool depth_always = std::getenv("COPA_DEPTH_ALWAYS") != nullptr;  // diagnostics
+    if (depth_always) d.DepthFunc = D3D11_COMPARISON_ALWAYS;
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+    d.StencilEnable = depth_active && (dc & 1);
+    d.StencilReadMask = UINT8(ref_front >> 8);
+    d.StencilWriteMask = UINT8(ref_front >> 16);
+    d.FrontFace.StencilFunc = CompareFunc(dc >> 8);
+    d.FrontFace.StencilFailOp = StencilOp(dc >> 11);
+    d.FrontFace.StencilPassOp = StencilOp(dc >> 14);
+    d.FrontFace.StencilDepthFailOp = StencilOp(dc >> 17);
+    if ((dc >> 7) & 1) {
+      d.BackFace.StencilFunc = CompareFunc(dc >> 20);
+      d.BackFace.StencilFailOp = StencilOp(dc >> 23);
+      d.BackFace.StencilPassOp = StencilOp(dc >> 26);
+      d.BackFace.StencilDepthFailOp = StencilOp(dc >> 29);
+    } else {
+      d.BackFace = d.FrontFace;
+    }
+    device_->CreateDepthStencilState(&d, ds.put());
+  }
+  context_->OMSetDepthStencilState(ds.get(), ref_front & 0xFF);
+
+  // Rasterizer.
+  uint32_t mode = dev.reg(0x2205);
+  bool poly_offset = (mode >> 11) & 3;
+  float offset_scale = poly_offset ? dev.reg_float(0x2380) : 0.0f;
+  float offset = poly_offset ? dev.reg_float(0x2381) : 0.0f;
+  uint32_t scale_bits, offset_bits;
+  std::memcpy(&scale_bits, &offset_scale, 4);
+  std::memcpy(&offset_bits, &offset, 4);
+  uint64_t rkey = (uint64_t(mode & 0x1F) | (uint64_t(scale_bits) << 5) ^ (uint64_t(offset_bits) << 31)) ^
+                  (uint64_t(bound_samples_ > 1) << 63);
+  auto& rs = raster_states_[rkey];
+  if (!rs) {
+    D3D11_RASTERIZER_DESC d{};
+    d.FillMode = ((mode >> 3) & 3) && ((mode >> 5) & 7) == 1 ? D3D11_FILL_WIREFRAME : D3D11_FILL_SOLID;
+    bool cull_front = mode & 1, cull_back = (mode >> 1) & 1;
+    d.CullMode = cull_front && !cull_back   ? D3D11_CULL_FRONT
+                 : cull_back && !cull_front ? D3D11_CULL_BACK
+                                            : D3D11_CULL_NONE;
+    d.FrontCounterClockwise = ((mode >> 2) & 1) == 0;
+#if PORT_GAME == PORT_GAME_COPA2014
+    static const bool cull_none = std::getenv("COPA_CULL_NONE") != nullptr;  // diagnostics
+    if (cull_none) d.CullMode = D3D11_CULL_NONE;
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+    d.DepthBias = INT(offset * 16777215.0f);
+    d.SlopeScaledDepthBias = offset_scale / 16.0f;
+    d.DepthClipEnable = TRUE;
+    d.ScissorEnable = TRUE;
+    d.MultisampleEnable = bound_samples_ > 1;
+    device_->CreateRasterizerState(&d, rs.put());
+  }
+  context_->RSSetState(rs.get());
+}
+
+// --------------------------------------------------------------------------- draw
+void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
+  RenderPhase profile(RenderProfile::Draw);
+  if (!EnsureDevice()) return;
+  ++frame_draws_;
+  if (tiling_) ++frame_tiled_draws_;
+#if PORT_GAME == PORT_GAME_COPA2014
+  const bool trace = TraceFrame(frame_);
+  // RB_MODECONTROL: 4 = color + depth, 5 = depth only (shadow maps, depth pre-passes).
+  static const bool no_depth_only = std::getenv("COPA_NO_DEPTH_ONLY") != nullptr;  // diagnostics
+  const uint32_t edram_mode = dev.reg(0x2208) & 7;
+  const bool depth_only = edram_mode == 5 && !no_depth_only;
+  if (edram_mode != 4 && edram_mode != 0 && !depth_only) {
+    // Copy/clear passes are handled by Resolve.
+#else /* street4 wc2010 */
+  bool trace = TraceFrame(frame_);
+  if ((dev.reg(0x2208) & 7) != 4 && (dev.reg(0x2208) & 7) != 0) {
+    // RB_MODECONTROL not in color+depth mode (copy/clear passes are handled by Resolve).
+#endif /* PORT_GAME */
+    if (trace) REXLOG_INFO("trace draw skip: modecontrol={:08X}", dev.reg(0x2208));
+    return;
+  }
+  // Shaders.
+  uint32_t program_cntl = dev.reg(0x2180);
+  uint32_t context_misc = dev.reg(0x2181);
+  ShaderKey vkey;
+  vkey.rect_list = draw.primitive == 8;
+  ShaderKey pkey;
+  pkey.param_gen = (program_cntl >> 18) & 1;
+  pkey.param_gen_register = uint8_t((context_misc >> 8) & 0xFF);
+  ShaderEntry* vs = GetShader(ShaderStage::kVertex,
+                              VertexShaderMicrocode(membase_, dev.u32(dev::kVertexShader)), vkey);
+  ShaderEntry* ps = GetShader(ShaderStage::kPixel,
+                              PixelShaderMicrocode(membase_, dev.u32(dev::kPixelShader)), pkey);
+  static int draw_logs = 0;
+  bool log_draw = draw_logs < 40 && frame_ < 3;
+  if (log_draw) {
+    ++draw_logs;
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_INFO("copa draw: prim={} count={} indexed={} vs={} ps={} surface={:08X} color0={:08X} "
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_INFO("wc2010 draw: prim={} count={} indexed={} vs={} ps={} surface={:08X} color0={:08X} "
+#else /* street4 */
+    REXLOG_INFO("street4 draw: prim={} count={} indexed={} vs={} ps={} surface={:08X} color0={:08X} "
+#endif /* PORT_GAME */
+                "depth={:08X} mask={:08X} modectl={:08X} vte={:08X}",
+                draw.primitive, draw.count, draw.indexed, vs != nullptr, ps != nullptr,
+                dev.reg(0x2000), dev.reg(0x2001), dev.reg(0x2002), dev.reg(0x2104), dev.reg(0x2208),
+                dev.reg(0x2206));
+  }
+  if (!vs) {
+    if (trace) REXLOG_INFO("trace draw skip: no vs ({:08X})", dev.u32(dev::kVertexShader));
+    return;
+  }
+
+  // Render targets.
+  uint32_t surface = dev.reg(0x2000);
+  uint32_t pitch = surface & 0x3FFF;
+  uint32_t window_br = dev.reg(0x2082);
+  uint32_t height = std::max<uint32_t>((window_br >> 16) & 0x3FFF, 1);
+  uint32_t width_scissor = window_br & 0x3FFF;
+  if (!pitch) pitch = std::max<uint32_t>(width_scissor, 1);
+  if (tiling_) {
+    pitch = tiling_width_;
+    height = tiling_height_;
+  }
+#if PORT_GAME == PORT_GAME_COPA2014
+#else /* street4 wc2010 */
+  if (!tiling_ && TraceSurface(width_scissor, height)) trace = true;
+#endif /* PORT_GAME */
+  uint32_t color_mask = dev.reg(0x2104);
+  uint32_t color_written = ps ? ps->meta.color_outputs : 0;
+  uint32_t active_mask = 0;
+  ID3D11RenderTargetView* rtvs[4] = {};
+  const uint32_t color_info_regs[4] = {0x2001, 0x2003, 0x2004, 0x2005};
+  float exp_scale[4] = {1, 1, 1, 1};
+  for (int i = 0; i < 4; ++i) {
+    bound_color_[i] = nullptr;
+#if PORT_GAME == PORT_GAME_COPA2014
+    if (depth_only || !((color_mask >> (4 * i)) & 0xF) || !(color_written & (1u << i))) continue;
+#else /* street4 wc2010 */
+    if (!((color_mask >> (4 * i)) & 0xF) || !(color_written & (1u << i))) continue;
+#endif /* PORT_GAME */
+    uint32_t info = dev.reg(color_info_regs[i]);
+#if PORT_GAME == PORT_GAME_COPA2014
+    auto* rt = GetRenderTarget(false, info & 0xFFF, (info >> 16) & 0xF, pitch, height);
+#else /* street4 wc2010 */
+    auto* rt = GetRenderTarget(dev, false, info & 0xFFF, (info >> 16) & 0xF, pitch, height);
+#endif /* PORT_GAME */
+    if (!rt) continue;
+    rtvs[i] = rt->rtv.get();
+    bound_color_[i] = rt;
+    active_mask |= 0xFu << (4 * i);
+    int bias = int32_t(info << 6) >> 26;
+    exp_scale[i] = std::ldexp(1.0f, bias);
+  }
+  uint32_t depthcontrol = dev.reg(0x2200);
+  bool depth_active = (depthcontrol & 0x3) != 0 || ps == nullptr;
+  ID3D11DepthStencilView* dsv = nullptr;
+  bound_depth_ = nullptr;
+  if ((depthcontrol & 0x3) != 0) {
+    uint32_t info = dev.reg(0x2002);
+#if PORT_GAME == PORT_GAME_COPA2014
+    if (auto* rt = GetRenderTarget(true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
+#else /* street4 wc2010 */
+    if (auto* rt = GetRenderTarget(dev, true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
+#endif /* PORT_GAME */
+      dsv = rt->dsv.get();
+      bound_depth_ = rt;
+    }
+  } else {
+    depth_active = false;
+  }
+  if (!active_mask && !dsv) {
+    if (trace) REXLOG_INFO("trace draw skip: no targets mask={:08X} written={:X} depthctl={:08X} ps={}",
+                           color_mask, color_written, depthcontrol, ps != nullptr);
+    return;
+  }
+  // Unbind any SRVs that alias the targets.
+  ID3D11ShaderResourceView* null_srvs[32] = {};
+  context_->PSSetShaderResources(0, 32, null_srvs);
+  context_->OMSetRenderTargets(4, rtvs, dsv);
+  bound_samples_ = bound_depth_ ? bound_depth_->samples : 1;
+  if (bound_depth_) bound_depth_->single_stale = true;
+  for (auto* c : bound_color_)
+    if (c) {
+      bound_samples_ = c->samples;
+      c->single_stale = true;
+    }
+
+  // Geometry.
+  D3D11_PRIMITIVE_TOPOLOGY topology;
+  std::vector<uint32_t> indices;
+  bool use_indices = false, rect_list = false;
+  if (!BuildIndices(draw, topology, indices, use_indices, rect_list, dev)) {
+    if (trace)
+      REXLOG_INFO("trace draw skip: indices prim={} n={} indexed={} ib={:08X} idx32={}", draw.primitive, draw.count,
+                  draw.indexed, draw.index_address, draw.index32);
+    return;
+  }
+  ID3D11Buffer* const cached_ib = cached_ib_;
+  const UINT index_count = cached_ib ? cached_index_count_ : UINT(indices.size());
+  if (cached_ib) {
+    context_->IASetIndexBuffer(cached_ib, DXGI_FORMAT_R32_UINT, 0);
+  } else if (use_indices) {
+    UpdateDynamicBuffer(index_buffer_, index_capacity_, D3D11_BIND_INDEX_BUFFER, indices.data(),
+                        uint32_t(indices.size() * 4));
+    context_->IASetIndexBuffer(index_buffer_.get(), DXGI_FORMAT_R32_UINT, 0);
+  }
+  context_->IASetPrimitiveTopology(topology);
+  context_->IASetInputLayout(nullptr);
+
+  // Constants.
+  SystemConstants sys{};
+  const uint8_t* bl = dev.bool_loop_constants();
+  for (int i = 0; i < 8; ++i) sys.bools[i] = LoadBE32(bl + i * 4);
+  for (int i = 0; i < 32; ++i) sys.loops[i] = LoadBE32(bl + 32 + i * 4);
+  for (int i = 0; i < 96; ++i) sys.vfetch_endian[i] = LoadBE32(dev.vertex_fetch_constant(i) + 4) & 3;
+  if (draw.vfetch_override) sys.vfetch_endian[draw.override_index] = draw.override_endian;
+  sys.viewport[0] = dev.reg_float(0x210F);
+  sys.viewport[1] = dev.reg_float(0x2110);
+  sys.viewport[2] = dev.reg_float(0x2111);
+  sys.viewport[3] = dev.reg_float(0x2112);
+  sys.viewport_z[0] = dev.reg_float(0x2113);
+  sys.viewport_z[1] = dev.reg_float(0x2114);
+  sys.viewport_z[2] = float(pitch);
+  sys.viewport_z[3] = float(height);
+  sys.vte_flags = dev.reg(0x2206);
+  sys.pixel_offset = (dev.reg(0x2302) & 1) ? 0.0f : 0.5f;
+  uint32_t window_offset = tiling_ ? 0 : dev.reg(0x2080);
+  bool vtx_window_offset = (dev.reg(0x2205) >> 16) & 1;
+  if (vtx_window_offset) {
+    sys.window_offset_x = float(int32_t(window_offset << 17) >> 17);
+    sys.window_offset_y = float(int32_t(window_offset << 1) >> 17);
+  }
+  sys.alpha_test = dev.reg(0x2202) & 0xF;
+#if PORT_GAME == PORT_GAME_COPA2014
+  static const bool no_alpha_test = std::getenv("COPA_NO_ALPHA_TEST") != nullptr;  // diagnostics
+  if (no_alpha_test) sys.alpha_test = 0;
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+  sys.alpha_ref = dev.reg_float(0x210E);
+  for (int i = 0; i < 4; ++i) sys.rt_exp_scale[i] = exp_scale[i];
+  float rt_scale = 1.0f;
+  for (int i = 3; i >= 0; --i)
+    if (bound_color_[i]) rt_scale = bound_color_[i]->scale;
+  if (!active_mask && bound_depth_) rt_scale = bound_depth_->scale;
+  sys.res_scale[0] = rt_scale;
+  sys.res_scale[1] = 1.0f / rt_scale;
+
+  // Textures (both stages share slots 0-31).
+  ID3D11ShaderResourceView* srvs[32] = {};
+  ID3D11ShaderResourceView* volumes[32] = {};
+  ID3D11SamplerState* samps[32] = {};
+  uint32_t tex_mask = vs->meta.tfetch_mask | (ps ? ps->meta.tfetch_mask : 0);
+  for (uint32_t slot = 0; slot < 32; ++slot) {
+    if (!(tex_mask & (1u << slot))) continue;
+    uint32_t f[6];
+    const uint8_t* fc = dev.fetch_constant(slot);
+    for (int k = 0; k < 6; ++k) f[k] = LoadBE32(fc + k * 4);
+    TextureDimension dim = (ps && (ps->meta.tfetch_mask & (1u << slot)))
+                               ? ps->meta.tfetch_dimension[slot]
+                               : vs->meta.tfetch_dimension[slot];
+    ID3D11ShaderResourceView* volume = nullptr;
+    srvs[slot] = GetTexture(f, dim, sys.tex_size[slot], dim == TextureDimension::k3D ? &volume : nullptr);
+    samps[slot] = GetSampler(f);
+    sys.tex_swizzle[slot] = (f[3] >> 1) & 0xFFF;
+    uint32_t sign_x = (f[0] >> 2) & 3;
+    int32_t exp_adjust = int32_t(f[3] << 13) >> 26;
+    sys.tex_flags[slot] = (sign_x == 2 ? 1u : 0u) | ((uint32_t(exp_adjust) & 0xFF) << 8);
+    if (volume && ps && (ps->meta.tfetch_mask & (1u << slot))) {
+      volumes[slot] = volume;
+      sys.tex_flags[slot] |= 2u;
+    }
+  }
+
+  // Vertex buffers.
+  ID3D11ShaderResourceView* vbs[96] = {};
+  for (size_t k = 0; k < vs->meta.vfetch_slots.size() && k < 96; ++k) {
+    uint32_t index = vs->meta.vfetch_slots[k];
+    if (draw.vfetch_override && index == draw.override_index) {
+      if (!ValidGuest(draw.override_address)) {
+        if (trace) REXLOG_INFO("trace draw skip: inline vertex address {:08X}", draw.override_address);
+        return;
+      }
+      vbs[k] = GetVertexBuffer(0, draw.override_bytes, false, Virtual(draw.override_address));
+      continue;
+    }
+    const uint8_t* vf = dev.vertex_fetch_constant(index);
+    uint32_t w0 = LoadBE32(vf), w1 = LoadBE32(vf + 4);
+    uint32_t address = (w0 & ~3u);  // dwords << 2 == bytes (type in low bits)
+    uint32_t bytes = ((w1 >> 2) & 0xFFFFFF) * 4;
+    if ((address & 0x1FFFFFFF) + bytes > 0x20000000u) bytes = 0x20000000u - (address & 0x1FFFFFFF);
+    vbs[k] = GetVertexBuffer(address, bytes, true, Physical(address));
+  }
+
+  // ALU constants: VS c0-c255 = dwords 0-1023, PS c0-c255 = dwords 1024-2047.
+  static thread_local std::vector<uint32_t> alu(2048);
+  if (natives::NativeOn()) {
+    LoadBE32Array(alu.data(), dev.vs_constants(), 1024);
+    LoadBE32Array(alu.data() + 1024, dev.ps_constants(), 1024);
+  } else {
+    for (int i = 0; i < 1024; ++i) {
+      alu[i] = LoadBE32(dev.vs_constants() + i * 4);
+      alu[1024 + i] = LoadBE32(dev.ps_constants() + i * 4);
+    }
+  }
+  // Shader literal constants: the D3D flush (GA_RENDERER -> GA_RENDERER_2) has the GPU load
+  // them straight from the shader's memory (LOAD_ALU_CONST), bypassing the device's
+  // constant shadow. Table at vs+0x368 / ps+0x28: [+0x14] = offset to a block whose +0x10
+  // is the byte size of {u16 first constant, u16 dword count, u32 data offset} entries
+  // starting at +0x14; data at shader base ([vs+0x20] / [ps+0x18]) + offset.
+  auto apply_literals = [&](uint32_t shader, uint32_t table_offset, uint32_t base_offset) {
+    if (!ValidGuest(shader)) return;
+    uint32_t table = shader + table_offset;
+    uint32_t rel = LoadBE32(Virtual(table + 0x14));
+    uint32_t data_base = LoadBE32(Virtual(shader + base_offset));
+    if (!rel || !ValidGuest(data_base)) return;
+    uint32_t block = table + rel;
+    uint32_t entry = block + 0x14, end = entry + LoadBE32(Virtual(block + 0x10));
+    for (int guard = 0; entry < end && guard < 256; ++guard, entry += 8) {
+      uint32_t head = LoadBE32(Virtual(entry));
+      uint32_t first = head >> 16, count = head & 0xFFFF;
+      if (!count) break;
+      uint32_t src = data_base + LoadBE32(Virtual(entry + 4));
+#if PORT_GAME == PORT_GAME_COPA2014
+      static std::set<uint64_t> literal_logged;
+      if (literal_logged.size() < 400 && literal_logged.insert((uint64_t(shader) << 16) ^ first).second) {
+        REXLOG_INFO("copa literals: shader={:08X} table+{:X} first={} dwords={} src={:08X} v0={:g}", shader,
+#elif PORT_GAME == PORT_GAME_WC2010
+      static int literal_logs = 0;
+      if (literal_logs < 40) {
+        ++literal_logs;
+        REXLOG_INFO("wc2010 literals: shader={:08X} table+{:X} first={} dwords={} src={:08X} v0={:g}", shader,
+#else /* street4 */
+      static int literal_logs = 0;
+      if (literal_logs < 40) {
+        ++literal_logs;
+        REXLOG_INFO("street4 literals: shader={:08X} table+{:X} first={} dwords={} src={:08X} v0={:g}", shader,
+#endif /* PORT_GAME */
+                    table_offset, first, count, src, ValidGuest(src) ? AsFloat(LoadBE32(Virtual(src))) : 0.0f);
+      }
+      if (!ValidGuest(src)) continue;
+      for (uint32_t k = 0; k < count && first * 4 + k < 2048; ++k)
+        alu[first * 4 + k] = LoadBE32(Virtual(src + k * 4));
+    }
+  };
+#if PORT_GAME == PORT_GAME_COPA2014
+  static const bool no_literals = std::getenv("COPA_NO_LITERALS") != nullptr;  // diagnostics
+  if (!no_literals) apply_literals(dev.u32(dev::kVertexShader), 0x368, 0x20);
+  if (!no_literals) apply_literals(dev.u32(dev::kPixelShader), 0x28, 0x18);
+  if (ps && !ea_postfx::Enabled(ps->effect_pass))
+#elif PORT_GAME == PORT_GAME_WC2010
+  apply_literals(dev.u32(dev::kVertexShader), 0x368, 0x20);
+  apply_literals(dev.u32(dev::kPixelShader), 0x28, 0x18);
+  if (trace && ps) {
+    REXLOG_INFO("wc2010 fx pass: {} c0=({:g},{:g},{:g},{:g}) c1=({:g},{:g},{:g},{:g})", ps->name,
+      AsFloat(alu[1024]), AsFloat(alu[1025]), AsFloat(alu[1026]), AsFloat(alu[1027]),
+      AsFloat(alu[1028]), AsFloat(alu[1029]), AsFloat(alu[1030]), AsFloat(alu[1031]));
+  }
+  if (ps && !ea_postfx::Enabled(ps->effect_pass)) {
+#else /* street4 */
+  apply_literals(dev.u32(dev::kVertexShader), 0x368, 0x20);
+  apply_literals(dev.u32(dev::kPixelShader), 0x28, 0x18);
+  if (trace && ps) {
+    REXLOG_INFO("street4 fx pass: {} c0=({:g},{:g},{:g},{:g}) c1=({:g},{:g},{:g},{:g})", ps->name,
+      AsFloat(alu[1024]), AsFloat(alu[1025]), AsFloat(alu[1026]), AsFloat(alu[1027]),
+      AsFloat(alu[1028]), AsFloat(alu[1029]), AsFloat(alu[1030]), AsFloat(alu[1031]));
+  }
+  if (ps && !ea_postfx::Enabled(ps->effect_pass)) {
+#endif /* PORT_GAME */
+    ea_postfx::Neutralize(ps->effect_pass, alu.data() + 1024);
+#if PORT_GAME == PORT_GAME_COPA2014
+  static const bool cache_constants = !std::getenv("COPA_NO_CONSTANT_CACHE");
+#elif PORT_GAME == PORT_GAME_WC2010
+    if (trace) REXLOG_INFO("wc2010 fx neutralized: {}", ps->name);
+  }
+  static const bool cache_constants = !std::getenv("WC2010_NO_CONSTANT_CACHE");
+#else /* street4 */
+    if (trace) REXLOG_INFO("street4 fx neutralized: {}", ps->name);
+  }
+  static const bool cache_constants = !std::getenv("STREET4_NO_CONSTANT_CACHE");
+#endif /* PORT_GAME */
+  auto upload_consts = [&](ID3D11Buffer* cb, const uint32_t* src,
+                           std::array<uint32_t, 1024>& previous, bool& valid) {
+    if (cache_constants && valid && std::memcmp(previous.data(), src, 4096) == 0) return;
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(context_->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+      std::memcpy(m.pData, src, 1024 * 4);
+      context_->Unmap(cb, 0);
+      std::memcpy(previous.data(), src, 4096);
+      valid = true;
+    }
+  };
+  upload_consts(cb_vs_.get(), alu.data(), last_vs_constants_, vs_constants_valid_);
+  upload_consts(cb_ps_.get(), alu.data() + 1024, last_ps_constants_, ps_constants_valid_);
+  {
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(context_->Map(cb_sys_.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+      std::memcpy(m.pData, &sys, sizeof(sys));
+      context_->Unmap(cb_sys_.get(), 0);
+    }
+  }
+  ID3D11Buffer* cbs[3] = {cb_vs_.get(), cb_ps_.get(), cb_sys_.get()};
+  context_->VSSetConstantBuffers(0, 3, cbs);
+  context_->PSSetConstantBuffers(0, 3, cbs);
+  context_->GSSetConstantBuffers(0, 3, cbs);
+  context_->VSSetShaderResources(0, 32, srvs);
+  context_->VSSetSamplers(0, 16, samps);
+  if (!vs->meta.vfetch_slots.empty())
+    context_->VSSetShaderResources(32, UINT(std::min<size_t>(vs->meta.vfetch_slots.size(), 96)), vbs);
+  context_->PSSetShaderResources(0, 32, srvs);
+  context_->PSSetShaderResources(kVolumeTextureBase, 32, volumes);
+  context_->PSSetSamplers(0, 16, samps);
+  context_->VSSetShader(vs->vs.get(), nullptr, 0);
+  context_->GSSetShader(rect_list ? rect_gs_.get() : nullptr, nullptr, 0);
+  context_->PSSetShader(ps ? ps->ps.get() : nullptr, nullptr, 0);
+
+  SetupStates(dev, active_mask, depth_active);
+
+  // Viewport covers the whole surface; the guest viewport is applied in the shader.
+  D3D11_VIEWPORT vp{0, 0, float(ScaledSize(pitch, rt_scale)), float(ScaledSize(height, rt_scale)), 0.0f, 1.0f};
+  context_->RSSetViewports(1, &vp);
+  uint32_t tl = dev.reg(0x2081), br = dev.reg(0x2082);
+  LONG sx0 = LONG(tl & 0x3FFF), sy0 = LONG((tl >> 16) & 0x3FFF);
+  LONG sx1 = LONG(br & 0x3FFF), sy1 = LONG((br >> 16) & 0x3FFF);
+  if (!(tl >> 31)) {
+    LONG ox = int32_t(window_offset << 17) >> 17, oy = int32_t(window_offset << 1) >> 17;
+    sx0 += ox; sx1 += ox; sy0 += oy; sy1 += oy;
+  }
+  uint32_t stl = dev.reg(0x200E), sbr = dev.reg(0x200F);
+  sx0 = std::max<LONG>(sx0, int32_t(stl << 17) >> 17);
+  sy0 = std::max<LONG>(sy0, int32_t(stl << 1) >> 17);
+  if (sbr & 0x7FFF) sx1 = std::min<LONG>(sx1, int32_t(sbr << 17) >> 17);
+  if ((sbr >> 16) & 0x7FFF) sy1 = std::min<LONG>(sy1, int32_t(sbr << 1) >> 17);
+  if (tiling_) {
+    // The window scissor is the tile's; the union of the tiles is drawn at once.
+    sx0 = sy0 = 0;
+    sx1 = LONG(pitch);
+    sy1 = LONG(height);
+  }
+  D3D11_RECT scissor{std::max<LONG>(sx0, 0), std::max<LONG>(sy0, 0),
+                     std::min<LONG>(sx1, LONG(pitch)), std::min<LONG>(sy1, LONG(height))};
+  if (trace) {
+    std::string tex;
+    for (uint32_t slot = 0; slot < 32; ++slot)
+      if (tex_mask & (1u << slot))
+        tex += fmt::format(" t{}={:08X}{}", slot, LoadBE32(dev.fetch_constant(slot) + 4) & ~0xFFFu,
+                           srvs[slot] ? "" : "(null)");
+#if PORT_GAME == PORT_GAME_COPA2014
+    for (uint8_t slot : vs->meta.vfetch_slots)
+      tex += fmt::format(" vf{}={:08X}:{:08X}", slot, LoadBE32(dev.vertex_fetch_constant(slot)),
+                         LoadBE32(dev.vertex_fetch_constant(slot) + 4));
+    REXLOG_INFO("trace draw prim={} n={} vs={:08X} ps={:08X} c0={:08X} z={:08X} pitch={} h={} mask={:08X} "
+                "act={:08X} dctl={:08X} woff={:08X} sc=({},{})-({},{}) vp=({:g},{:g},{:g},{:g}) vte={:08X} at={:X}/{:g}{}",
+#else /* street4 wc2010 */
+    REXLOG_INFO("trace draw prim={} n={} vs={:08X} ps={:08X} c0={:08X} z={:08X} pitch={} h={} scale={:g} mask={:08X} "
+                "act={:08X} dctl={:08X} woff={:08X} sc=({},{})-({},{}) vp=({:g},{:g},{:g},{:g}) vte={:08X}{}",
+#endif /* PORT_GAME */
+                draw.primitive, draw.count, dev.u32(dev::kVertexShader), dev.u32(dev::kPixelShader),
+#if PORT_GAME == PORT_GAME_COPA2014
+                dev.reg(0x2001), dev.reg(0x2002), pitch, height, color_mask, active_mask, depthcontrol,
+#else /* street4 wc2010 */
+                dev.reg(0x2001), dev.reg(0x2002), pitch, height, rt_scale, color_mask, active_mask, depthcontrol,
+#endif /* PORT_GAME */
+                window_offset, scissor.left, scissor.top, scissor.right, scissor.bottom, sys.viewport[0],
+#if PORT_GAME == PORT_GAME_COPA2014
+                sys.viewport[1], sys.viewport[2], sys.viewport[3], sys.vte_flags, sys.alpha_test, sys.alpha_ref, tex);
+  }
+  if (glitch_log_enabled_ && dev.u32(dev::kVertexShader) == 0xF0221E60 && pitch_srvs_[mask_snap_cur_].empty()) {
+    for (int slot = 0; slot < 32; ++slot)
+      if ((tex_mask & (1u << slot)) && srvs[slot]) {
+        srvs[slot]->AddRef();
+        Com<ID3D11ShaderResourceView> ref;
+        *ref.put() = srvs[slot];
+        pitch_srvs_[mask_snap_cur_].emplace_back(slot, std::move(ref));
+      }
+  }
+  if (glitch_log_enabled_) {
+    // Diagnostics (COPA_GLITCH_DETECT): a summary of every draw of this frame.
+    std::string tex;
+    for (uint32_t slot = 0; slot < 32; ++slot)
+      if (tex_mask & (1u << slot)) tex += fmt::format(" t{}={:08X}", slot, LoadBE32(dev.fetch_constant(slot) + 4) & ~0xFFFu);
+    for (uint8_t slot : vs->meta.vfetch_slots) {
+      uint32_t w0 = LoadBE32(dev.vertex_fetch_constant(slot)), w1 = LoadBE32(dev.vertex_fetch_constant(slot) + 4);
+      uint32_t bytes = std::min<uint32_t>(((w1 >> 2) & 0xFFFFFF) * 4, 16u << 20);
+      tex += fmt::format(" vf{}={:08X}/{:08X}", slot, w0,
+                         ValidGuest(w0 & ~3u) ? uint32_t(Hash64(Physical(w0 & ~3u), bytes)) : 0u);
+    }
+    {
+      std::string fc;
+      for (uint32_t slot = 0; slot < 32; ++slot)
+        if (tex_mask & (1u << slot)) fc += fmt::format(" f{}={:08X}", slot, uint32_t(Hash64(dev.fetch_constant(slot), 24)));
+      tex += fc + fmt::format(" sys={:08X} samp={:08X}", uint32_t(Hash64(&sys, sizeof(sys))),
+                              uint32_t(Hash64(samps, sizeof(samps))));
+    }
+    tex += fmt::format(" vse={} pse={}", vs->name, ps ? ps->name : std::string("-"));
+    {
+      // Both microcode bindings of the vertex shader object (see VertexShaderMicrocode).
+      uint32_t so = dev.u32(dev::kVertexShader);
+      if (ValidGuest(so)) {
+        const uint8_t* sp = Virtual(so);
+        uint32_t flags = LoadBE32(sp + 0x368), ucode_base = LoadBE32(sp + 0x20);
+        tex += fmt::format(" tid={} vsflags={:08X}", GetCurrentThreadId(), flags);
+        for (int b = 0; b < 2; ++b) {
+          uint32_t rel = LoadBE32(sp + 0x380 + 8 * b);
+          if (b == 1 && !(flags & 0x20)) continue;  // only shaders with two bindings
+          uint32_t record = so + rel;
+          if (!rel || !ValidGuest(record) || !ValidGuest(ucode_base)) continue;
+          uint32_t addr = ucode_base + LoadBE32(Virtual(record + 0x368));
+          uint32_t size = LoadBE32(Virtual(record + 0x36C));
+          if ((addr & 3) || !size || size > 0x8000 || !ValidGuest(addr) || !ValidGuest(addr + size - 1)) continue;
+          tex += fmt::format(" b{}={:08X}/{:08X}", b, addr, ValidGuest(addr) ? uint32_t(Hash64(Virtual(addr), size)) : 0u);
+        }
+      }
+    }
+    tex += fmt::format(" host rt0={} ds={} pending_ds_clear={}",
+                       bound_color_[0] ? static_cast<const void*>(bound_color_[0]->texture.get()) : nullptr,
+                       bound_depth_ ? static_cast<const void*>(bound_depth_->texture.get()) : nullptr,
+                       tile_depth_clear_.dsv ? (bound_depth_ && tile_depth_clear_.dsv.get() == bound_depth_->dsv.get()
+                                                    ? "THIS" : "other")
+                                             : "no");
+    tex += fmt::format(" psc={:08X} bl={:08X}", uint32_t(Hash64(alu.data() + 1024, 1024 * 4)),
+                       uint32_t(Hash64(dev.bool_loop_constants(), 32 * 4 + 32 * 4)));
+    if (dev.u32(dev::kVertexShader) == 0xF0221E60) {
+      tex += " psc0-31=";
+      for (int i = 0; i < 128; ++i) tex += fmt::format("{}{:g}", i % 4 ? "," : "/", AsFloat(alu[1024 + i]));
+    }
+    tex += fmt::format(" idx={:08X} dctl={:08X} stencil={:08X}/{:08X} blend={:08X} mode={:08X} cull={:08X} mask={:08X}",
+                       uint32_t(Hash64(indices.data(), indices.size() * 4)), dev.reg(0x2200), dev.reg(0x210C),
+                       dev.reg(0x210D), dev.reg(0x2201), dev.reg(0x2208), dev.reg(0x2205), dev.reg(0x2104));
+    frame_draw_log_.push_back(fmt::format(
+        "prim={} n={} vs={:08X} ps={:08X} c0={:08X} z={:08X} rt={}x{} vp=({:g},{:g},{:g},{:g}) vsc={:016X} c0-3=({:g},{:g},{:g},{:g})/({:g},{:g},{:g},{:g}) c32-35={}{}",
+        draw.primitive, draw.count, dev.u32(dev::kVertexShader), dev.u32(dev::kPixelShader), dev.reg(0x2001),
+        dev.reg(0x2002), pitch, height, sys.viewport[0], sys.viewport[1], sys.viewport[2], sys.viewport[3],
+        Hash64(alu.data(), 1024 * 4), AsFloat(alu[0]), AsFloat(alu[1]), AsFloat(alu[2]), AsFloat(alu[3]), AsFloat(alu[4]),
+        AsFloat(alu[5]), AsFloat(alu[6]), AsFloat(alu[7]), [&] {
+          std::string m;
+          for (int i = 128; i < 144; ++i) m += fmt::format("{}{:g}", i % 4 ? "," : "/", AsFloat(alu[i]));
+          return m;
+        }(), tex));
+#else /* street4 wc2010 */
+                sys.viewport[1], sys.viewport[2], sys.viewport[3], sys.vte_flags, tex);
+    REXLOG_INFO("trace draw blend: blend0={:08X} colorctl={:08X} factor=({:g},{:g},{:g},{:g}) rt_fmt={} exp={:g}",
+                dev.reg(0x2201), dev.reg(0x2202), dev.reg_float(0x2105), dev.reg_float(0x2106),
+                dev.reg_float(0x2107), dev.reg_float(0x2108), (dev.reg(0x2001) >> 16) & 0xF, exp_scale[0]);
+#endif /* PORT_GAME */
+  }
+  if (scissor.right <= scissor.left || scissor.bottom <= scissor.top) {
+    if (trace) REXLOG_INFO("trace draw skip: empty scissor");
+    return;
+  }
+  D3D11_RECT host_scissor = ScaledRect(scissor.left, scissor.top, scissor.right, scissor.bottom, rt_scale);
+  context_->RSSetScissorRects(1, &host_scissor);
+
+#if PORT_GAME == PORT_GAME_COPA2014
+  static const bool dump_draw = std::getenv("COPA_DUMP_DRAW") != nullptr;
+#elif PORT_GAME == PORT_GAME_WC2010
+  static const bool dump_draw = std::getenv("WC2010_DUMP_DRAW") != nullptr;
+#else /* street4 */
+  static const bool dump_draw = std::getenv("STREET4_DUMP_DRAW") != nullptr;
+#endif /* PORT_GAME */
+  if (dump_draw && ps) {
+    static std::string dumped;
+    char ps_name[32];
+    snprintf(ps_name, sizeof(ps_name), "%p", static_cast<void*>(ps));
+    if (dumped.find(ps_name) == std::string::npos && dumped.size() < 4000) {
+      dumped += ps_name;
+      std::string c;
+      for (int i = 0; i < 12; ++i) {
+        const uint8_t* v = dev.vs_constants() + i * 16;
+        c += fmt::format(" c{}=({:g},{:g},{:g},{:g})", i, AsFloat(LoadBE32(v)), AsFloat(LoadBE32(v + 4)),
+                         AsFloat(LoadBE32(v + 8)), AsFloat(LoadBE32(v + 12)));
+      }
+      std::string verts;
+      if (draw.vfetch_override) {
+        const uint8_t* d = Virtual(draw.override_address);
+        for (uint32_t i = 0; i < std::min<uint32_t>(draw.override_bytes / 4, 24); ++i)
+          verts += fmt::format(" {:g}", AsFloat(LoadBE32(d + i * 4)));
+      }
+#if PORT_GAME == PORT_GAME_COPA2014
+      REXLOG_INFO("copa drawdump ps={} prim={} count={} vp=({:g},{:g},{:g},{:g},{:g},{:g}) vte={:08X} "
+#elif PORT_GAME == PORT_GAME_WC2010
+      REXLOG_INFO("wc2010 drawdump ps={} prim={} count={} vp=({:g},{:g},{:g},{:g},{:g},{:g}) vte={:08X} "
+#else /* street4 */
+      REXLOG_INFO("street4 drawdump ps={} prim={} count={} vp=({:g},{:g},{:g},{:g},{:g},{:g}) vte={:08X} "
+#endif /* PORT_GAME */
+                  "rt={}x{} tex={:08X}{} verts:{}",
+                  ps_name, draw.primitive, draw.count, sys.viewport[0], sys.viewport[1],
+                  sys.viewport[2], sys.viewport[3], sys.viewport_z[0], sys.viewport_z[1],
+                  sys.vte_flags, pitch, height, tex_mask, c, verts);
+    }
+  }
+  Com<ID3D11Query> samples_query;
+  if (trace) {
+    D3D11_QUERY_DESC qd{D3D11_QUERY_OCCLUSION, 0};
+    device_->CreateQuery(&qd, samples_query.put());
+    if (samples_query) context_->Begin(samples_query.get());
+  }
+#if PORT_GAME == PORT_GAME_COPA2014
+  if (glitch_log_enabled_ && !draw.vfetch_override) {
+    // Diagnostics: vertex fetches past the fetch constant's size read whatever the host buffer
+    // holds there (undefined after a WRITE_DISCARD).
+    uint32_t max_index = 0;
+    for (uint32_t v : indices) if (v != 0xFFFFFFFFu) max_index = std::max(max_index, v);
+    for (size_t k = 0; k < vs->meta.vfetch_slots.size() && k < vs->meta.vfetch_stride.size(); ++k) {
+      const uint8_t* vf = dev.vertex_fetch_constant(vs->meta.vfetch_slots[k]);
+      uint32_t bytes = ((LoadBE32(vf + 4) >> 2) & 0xFFFFFF) * 4;
+      uint64_t need = (uint64_t(max_index) * vs->meta.vfetch_stride[k] + vs->meta.vfetch_end[k]) * 4;
+      if (need > bytes) {
+        static std::set<uint64_t> seen;
+        uint64_t id = (uint64_t(dev.u32(dev::kVertexShader)) << 8) | vs->meta.vfetch_slots[k];
+        if (seen.size() < 200 && seen.insert(id).second)
+          REXLOG_WARN("copa vfetch overrun: vs={:08X} vf{} stride={} end={} max_index={} need={} bytes={} frame={}",
+                      dev.u32(dev::kVertexShader), vs->meta.vfetch_slots[k], vs->meta.vfetch_stride[k],
+                      vs->meta.vfetch_end[k], max_index, need, bytes, frame_);
+      }
+    }
+  }
+  const bool pitch_draw = glitch_log_enabled_ && dev.u32(dev::kVertexShader) == 0xF0221E60;
+  if (pitch_draw && !pitch_draws_[mask_snap_cur_]++) {
+    CapturePitch(pitch_cap_[mask_snap_cur_][0], bound_color_[0], bound_depth_);
+    std::memcpy(pitch_vsc_[frame_ % 3].data(), alu.data(), 1024 * 4);
+    pitch_vsc_frame_[frame_ % 3] = frame_;
+  }
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+  if (use_indices) context_->DrawIndexed(index_count, 0, 0);
+  else context_->Draw(draw.count, draw.first_vertex);
+#if PORT_GAME == PORT_GAME_COPA2014
+  if (pitch_draw) {
+    CapturePitch(pitch_cap_[mask_snap_cur_][1], bound_color_[0], bound_depth_);
+    if (pitch_draws_[mask_snap_cur_] == 1)
+      for (int slot = 0; slot < 32; ++slot)
+        if ((tex_mask & (1u << slot)) && srvs[slot]) CaptureSrv(pitch_srv_cap_[mask_snap_cur_][slot], srvs[slot]);
+  }
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+  if (samples_query) {
+    context_->End(samples_query.get());
+    UINT64 passed = 0;
+    while (context_->GetData(samples_query.get(), &passed, sizeof(passed), 0) == S_FALSE) {}
+    REXLOG_INFO("trace draw samples={} (vs={:08X} ps={:08X} n={}) vpz=({:g},{:g}) clip={:08X}", passed,
+                dev.u32(dev::kVertexShader), dev.u32(dev::kPixelShader), draw.count, sys.viewport_z[0],
+                sys.viewport_z[1], dev.reg(0x2204));
+#if PORT_GAME == PORT_GAME_COPA2014
+    static int zero_logs = 0;
+    static const uint32_t diag_vs = std::getenv("COPA_DIAG_VS") ? uint32_t(std::strtoul(std::getenv("COPA_DIAG_VS"), nullptr, 16)) : 0;
+    bool diag = diag_vs && dev.u32(dev::kVertexShader) == diag_vs;
+    if ((!passed || diag) && !draw.vfetch_override && zero_logs++ < 60) {
+      // Diagnostics: clip-space position of the first vertices (float3 at offset 0, c0-c3 rows).
+      static const uint32_t stride = std::getenv("COPA_DIAG_STRIDE") ? std::atoi(std::getenv("COPA_DIAG_STRIDE")) : 24;
+      const uint8_t* vf = dev.vertex_fetch_constant(vs->meta.vfetch_slots.empty() ? 0 : vs->meta.vfetch_slots[0]);
+      uint32_t address = LoadBE32(vf) & ~3u, size = LoadBE32(vf + 4) & ~3u;
+      uint32_t max_index = 0;
+      for (uint32_t v : indices) if (v != 0xFFFFFFFFu) max_index = std::max(max_index, v);
+      uint32_t resets = 0;
+      for (uint32_t v : indices) resets += v == 0xFFFFFFFFu;
+      std::string s = fmt::format("vb={:08X} fetch1={:08X} n={} max_index={} resets={} idx32={} reset_ena={} reset_idx={:X} base={} ia={:08X} idx:",
+                                  address, size, indices.size(), max_index, resets, draw.index32,
+                                  (dev.reg(0x2205) >> 21) & 1, dev.reg(0x2103), draw.base_vertex, draw.index_address);
+      for (size_t i = 0; i < std::min<size_t>(indices.size(), 24); ++i) s += fmt::format(" {:X}", indices[i]);
+      for (size_t i = 0; i < std::min<size_t>(indices.size(), 3); ++i) {
+        const uint8_t* q = Physical(address) + indices[i] * stride;
+        float pos[4] = {AsFloat(LoadBE32(q)), AsFloat(LoadBE32(q + 4)), AsFloat(LoadBE32(q + 8)), 1.0f};
+        float clip[4];
+        for (int r = 0; r < 4; ++r) {
+          clip[r] = 0;
+          for (int k = 0; k < 4; ++k) clip[r] += AsFloat(LoadBE32(dev.vs_constants() + r * 16 + k * 4)) * pos[k];
+        }
+        s += fmt::format(" | p=({:g},{:g},{:g}) clip=({:g},{:g},{:g},{:g})", pos[0], pos[1], pos[2], clip[0], clip[1], clip[2], clip[3]);
+      }
+      // Triangles fully inside the clip volume (triangle lists only).
+      uint32_t inside = 0, total = 0;
+      if (draw.primitive == 4) {
+        auto clip_of = [&](uint32_t index, float* c) {
+          const uint8_t* q = Physical(address) + index * stride;
+          float pos[4] = {AsFloat(LoadBE32(q)), AsFloat(LoadBE32(q + 4)), AsFloat(LoadBE32(q + 8)), 1.0f};
+          for (int r = 0; r < 4; ++r) {
+            c[r] = 0;
+            for (int k = 0; k < 4; ++k) c[r] += AsFloat(LoadBE32(dev.vs_constants() + r * 16 + k * 4)) * pos[k];
+          }
+        };
+        for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+          ++total;
+          bool ok = true;
+          for (int k = 0; k < 3 && ok; ++k) {
+            float c[4];
+            clip_of(indices[i + k], c);
+            ok = c[3] > 0 && std::fabs(c[0]) <= c[3] && std::fabs(c[1]) <= c[3] && c[2] >= 0 && c[2] <= c[3];
+          }
+          inside += ok;
+        }
+      }
+      if (std::getenv("COPA_DIAG_HALF")) {
+        // half4 position (pairs swapped as the fetch swizzle does), matrix at c[COPA_DIAG_MAT].
+        static const int mat = std::getenv("COPA_DIAG_MAT") ? std::atoi(std::getenv("COPA_DIAG_MAT")) : 32;
+        auto half = [](uint16_t h) {
+          uint32_t sgn = uint32_t(h & 0x8000) << 16, e = (h >> 10) & 31, mant = h & 0x3FF;
+          uint32_t f = e == 0 ? sgn : e == 31 ? (sgn | 0x7F800000 | (mant << 13)) : (sgn | ((e + 112) << 23) | (mant << 13));
+          float r; std::memcpy(&r, &f, 4); return r;
+        };
+        std::string hs;
+        for (size_t i = 0; i < std::min<size_t>(indices.size(), 8); ++i) {
+          const uint8_t* q = Physical(address) + indices[i] * stride;
+          uint32_t w0 = LoadBE32(q), w1 = LoadBE32(q + 4);
+          float pos[4] = {half(uint16_t(w0 >> 16)), half(uint16_t(w0)), half(uint16_t(w1 >> 16)), half(uint16_t(w1))};
+          float c[4];
+          for (int r = 0; r < 4; ++r) {
+            c[r] = 0;
+            for (int kk = 0; kk < 4; ++kk) c[r] += alu[(mat + r) * 4 + kk] * 0 + AsFloat(alu[(mat + r) * 4 + kk]) * pos[kk];
+          }
+          hs += fmt::format(" | p=({:g},{:g},{:g},{:g}) ndc=({:g},{:g},{:g}) w={:g}", pos[0], pos[1], pos[2], pos[3],
+                            c[0] / c[3], c[1] / c[3], c[2] / c[3], c[3]);
+        }
+        REXLOG_INFO("trace half geometry:{}", hs);
+      }
+      std::string k;
+      for (int i : {0, 1, 2, 3, 4, 5, 6, 7, 8, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 252, 253, 254, 255})
+        k += fmt::format(" c{}=({:g},{:g},{:g},{:g})", i, AsFloat(alu[i * 4]), AsFloat(alu[i * 4 + 1]),
+                         AsFloat(alu[i * 4 + 2]), AsFloat(alu[i * 4 + 3]));
+      REXLOG_INFO("trace zero-sample geometry: inside={}/{} cull={:08X} {} alu:{}", inside, total, dev.reg(0x2205), s, k);
+    }
+#else /* street4 wc2010 */
+    if (draw.primitive == 1)
+      REXLOG_INFO("trace draw points: point_size={:08X} point_minmax={:08X} line_cntl={:08X} vte={:08X} "
+                  "su_sc_mode={:08X} vs_writes_psize={}",
+                  dev.reg(0x2280), dev.reg(0x2281), dev.reg(0x2282), dev.reg(0x2206), dev.reg(0x2205),
+                  vs->meta.hlsl.find("o_misc.x") != std::string::npos);
+#endif /* PORT_GAME */
+    static std::unordered_map<uint64_t, int> consts_logged;
+    uint64_t pair = (uint64_t(dev.u32(dev::kVertexShader)) << 32) | dev.u32(dev::kPixelShader);
+    if (!passed && consts_logged[pair]++ == 0) {
+      std::string c;
+      for (int i : {0, 1, 2, 3, 4, 5, 6, 48, 52, 53, 54, 55, 63, 64, 65, 66}) {
+        const uint8_t* v = dev.vs_constants() + i * 16;
+        c += fmt::format(" c{}=({:g},{:g},{:g},{:g})", i, AsFloat(LoadBE32(v)), AsFloat(LoadBE32(v + 4)),
+                         AsFloat(LoadBE32(v + 8)), AsFloat(LoadBE32(v + 12)));
+      }
+      std::string verts;
+      if (draw.vfetch_override) {
+        const uint8_t* d = Virtual(draw.override_address);
+        for (uint32_t i = 0; i < std::min<uint32_t>(draw.override_bytes / 4, 18); ++i)
+          verts += fmt::format(" {:g}", AsFloat(LoadBE32(d + i * 4)));
+      } else {
+        const uint8_t* vf = dev.vertex_fetch_constant(vs->meta.vfetch_slots.empty() ? 0 : vs->meta.vfetch_slots[0]);
+        uint32_t address = LoadBE32(vf) & ~3u;
+        uint32_t first = indices.empty() ? 0 : indices[0];
+        verts = fmt::format(" vb={:08X} idx0={} w0..:", address, first);
+        for (uint32_t i = 0; i < 9; ++i)
+          verts += fmt::format(" {:g}", AsFloat(LoadBE32(Physical(address) + first * 36 + i * 4)));
+      }
+      REXLOG_INFO("trace zero-sample consts:{} verts:{}", c, verts);
+    }
+  }
+  if (trace && bound_color_[0]) {
+    // Diagnostics: the color target after the first draw of each shader pair.
+#if PORT_GAME == PORT_GAME_COPA2014
+    static const char* dump_dir = std::getenv("COPA_SHOT_DIR");
+#elif PORT_GAME == PORT_GAME_WC2010
+    static const char* dump_dir = std::getenv("WC2010_SHOT_DIR");
+#else /* street4 */
+    static const char* dump_dir = std::getenv("STREET4_SHOT_DIR");
+#endif /* PORT_GAME */
+    static std::unordered_map<uint64_t, int> seen;
+    uint64_t pair = (uint64_t(dev.u32(dev::kVertexShader)) << 32) | dev.u32(dev::kPixelShader);
+#if PORT_GAME == PORT_GAME_COPA2014
+    if (dump_dir && !seen.count(pair) && seen.size() < 48) {
+#elif PORT_GAME == PORT_GAME_WC2010
+    // WC2010_TRACE_DUMP_PER_TEXTURE=1: one dump per shader pair and texture 0 (passes that draw
+    // the same shaders with many textures, like lightmapped geometry).
+    static const bool per_texture = std::getenv("WC2010_TRACE_DUMP_PER_TEXTURE") != nullptr;
+    if (per_texture) pair ^= uint64_t(LoadBE32(dev.fetch_constant(0) + 4) & ~0xFFFu) * 0x9E3779B97F4A7C15ull;
+    if (dump_dir && !seen.count(pair) && seen.size() < (per_texture ? 400u : 48u)) {
+#else /* street4 */
+    // STREET4_TRACE_DUMP_PER_TEXTURE=1: one dump per shader pair and texture 0 (passes that draw
+    // the same shaders with many textures, like lightmapped geometry).
+    static const bool per_texture = std::getenv("STREET4_TRACE_DUMP_PER_TEXTURE") != nullptr;
+    if (per_texture) pair ^= uint64_t(LoadBE32(dev.fetch_constant(0) + 4) & ~0xFFFu) * 0x9E3779B97F4A7C15ull;
+    if (dump_dir && !seen.count(pair) && seen.size() < (per_texture ? 400u : 48u)) {
+#endif /* PORT_GAME */
+      int n = int(seen.size());
+      seen[pair] = n;
+      {
+        std::string c;
+        for (int i = 0; i < 20; ++i)
+          c += fmt::format(" c{}=({:g},{:g},{:g},{:g})", i, AsFloat(alu[1024 + i * 4]), AsFloat(alu[1024 + i * 4 + 1]),
+                           AsFloat(alu[1024 + i * 4 + 2]), AsFloat(alu[1024 + i * 4 + 3]));
+        for (int i = 252; i < 256; ++i)
+          c += fmt::format(" c{}=({:g},{:g},{:g},{:g})", i, AsFloat(alu[1024 + i * 4]), AsFloat(alu[1024 + i * 4 + 1]),
+                           AsFloat(alu[1024 + i * 4 + 2]), AsFloat(alu[1024 + i * 4 + 3]));
+#if PORT_GAME == PORT_GAME_COPA2014
+        REXLOG_INFO("trace psconst draw-{:02}:{}", int(seen.size()), c);
+#else /* street4 wc2010 */
+        REXLOG_INFO("trace psconst draw-{:02}:{}", n, c);
+        // Host-endian VS c0-c255 followed by PS c0-c255, including shader literals.
+        // In particular this preserves the CPU-generated crowd lighting for A/B checks.
+        std::ofstream(fmt::format("{}/draw-{:02}-constants.bin", dump_dir, n), std::ios::binary)
+            .write(reinterpret_cast<const char*>(alu.data()), alu.size() * 4);
+#endif /* PORT_GAME */
+      }
+      REXLOG_INFO("trace dump draw-{:02} vs={:08X} ps={:08X} {} {}", n, dev.u32(dev::kVertexShader),
+                  dev.u32(dev::kPixelShader), vs->name, ps ? ps->name : std::string("-"));
+      DumpTexture(bound_color_[0]->texture.get(),
+                  fmt::format("{}/draw-{:02}-{:08X}-{:08X}.bmp", dump_dir, n, dev.u32(dev::kVertexShader),
+                              dev.u32(dev::kPixelShader)));
+      // Every bound 2D texture, drawn into an RGBA8 target (handles block-compressed formats).
+      for (uint32_t slot = 0; slot < 32; ++slot) {
+        if (!srvs[slot]) continue;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+        srvs[slot]->GetDesc(&sd);
+        if (sd.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D) {
+          uint32_t fc[6];
+          for (int k = 0; k < 6; ++k) fc[k] = LoadBE32(dev.fetch_constant(slot) + k * 4);
+          TextureDesc td3 = TextureDescFromFetch(fc);
+          const uint8_t* mem = Physical(td3.base_address);
+          uint64_t nonzero = 0;
+          for (uint32_t b = 0; b < 65536; ++b) nonzero += mem[b] != 0;
+          std::string hex;
+          for (uint32_t b = 0; b < 48; ++b) hex += fmt::format("{:02X}{}", mem[b], (b & 15) == 15 ? " " : "");
+          REXLOG_INFO("trace tex draw-{:02} t{} (view dim {}): fetch={:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+                      "fmt={} {}x{}x{} dim={} tiled={} nonzero64k={} bytes@0: {}",
+                      n, slot, int(sd.ViewDimension), fc[0], fc[1], fc[2], fc[3], fc[4], fc[5], td3.format,
+                      td3.width, td3.height, td3.depth, td3.dimension, td3.tiled, nonzero, hex);
+          continue;
+        }
+        Com<ID3D11Resource> res;
+        srvs[slot]->GetResource(res.put());
+        D3D11_TEXTURE2D_DESC sdesc;
+        static_cast<ID3D11Texture2D*>(res.get())->GetDesc(&sdesc);
+        D3D11_TEXTURE2D_DESC td{std::min(sdesc.Width, 1024u), std::min(sdesc.Height, 1024u), 1, 1,
+                                DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
+                                D3D11_BIND_RENDER_TARGET, 0, 0};
+        Com<ID3D11Texture2D> tmp;
+        Com<ID3D11RenderTargetView> tmp_rtv;
+        device_->CreateTexture2D(&td, nullptr, tmp.put());
+        if (!tmp) continue;
+        device_->CreateRenderTargetView(tmp.get(), nullptr, tmp_rtv.put());
+        D3D11_VIEWPORT tvp{0, 0, float(td.Width), float(td.Height), 0, 1};
+        BlitTo(tmp_rtv.get(), td.Width, td.Height, tvp, srvs[slot], float(sdesc.Width), float(sdesc.Height),
+               0, 0, 1, 1, false);
+        uint32_t f1 = LoadBE32(dev.fetch_constant(slot) + 4);
+        {
+          uint32_t fc[6];
+          for (int k = 0; k < 6; ++k) fc[k] = LoadBE32(dev.fetch_constant(slot) + k * 4);
+          TextureDesc td2 = TextureDescFromFetch(fc);
+          uint64_t nonzero = 0;
+          const uint8_t* mem = Physical(td2.base_address ? td2.base_address : td2.mip_address);
+          for (uint32_t b = 0; b < 65536; ++b) nonzero += mem[b] != 0;
+          REXLOG_INFO("trace tex draw-{:02} t{}: fetch={:08X} {:08X} {:08X} {:08X} {:08X} {:08X} fmt={} {}x{}x{} "
+                      "tiled={} packed={} base={:08X} mip={:08X} mips={}-{} nonzero64k={} resolved={} bound_resolved={} bgra={}",
+                      n, slot, fc[0], fc[1], fc[2], fc[3], fc[4], fc[5], td2.format, td2.width, td2.height,
+                      td2.depth, td2.tiled, td2.packed_mips, td2.base_address, td2.mip_address, td2.mip_min,
+                      td2.mip_max, nonzero, resolved_.count(td2.base_address) != 0,
+                      resolved_.count(td2.base_address) && resolved_[td2.base_address]->srv.get() == srvs[slot],
+                      resolved_.count(td2.base_address) && resolved_[td2.base_address]->bgra);
+          std::string hex;
+          for (uint32_t b = 0; b < 48; ++b) hex += fmt::format("{:02X}{}", mem[0x8000 + b], (b & 15) == 15 ? " " : "");
+          REXLOG_INFO("trace tex draw-{:02} t{} bytes@8000: {}", n, slot, hex);
+        }
+        DumpTexture(tmp.get(), fmt::format("{}/draw-{:02}-tex{}-{:08X}-fmt{}-dxgi{}.bmp", dump_dir, n, slot,
+                                           f1 & ~0xFFFu, f1 & 0x3F, int(sdesc.Format)));
+      }
+    }
+  }
+}
+
+// --------------------------------------------------------------------------- blit
+void RendererImpl::BlitTo(ID3D11RenderTargetView* rtv, uint32_t, uint32_t, D3D11_VIEWPORT vp,
+                          ID3D11ShaderResourceView* src, float, float, float u0, float v0,
+                          float u1, float v1, bool depth, bool swap_rb, bool point,
+                          ID3D11PixelShader* shader) {
+  float cb[8] = {u0, v0, u1 - u0, v1 - v0, 1.0f, swap_rb ? 1.0f : 0.0f, 0, 0};
+  D3D11_MAPPED_SUBRESOURCE m;
+  if (SUCCEEDED(context_->Map(cb_blit_.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+    std::memcpy(m.pData, cb, sizeof(cb));
+    context_->Unmap(cb_blit_.get(), 0);
+  }
+  ID3D11ShaderResourceView* null_srvs[32] = {};
+  context_->PSSetShaderResources(0, 32, null_srvs);
+  context_->OMSetRenderTargets(1, &rtv, nullptr);
+  context_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+  context_->OMSetDepthStencilState(no_depth_.get(), 0);
+  context_->RSSetState(blit_raster_.get());
+  context_->RSSetViewports(1, &vp);
+  D3D11_RECT r{LONG(vp.TopLeftX), LONG(vp.TopLeftY), LONG(vp.TopLeftX + vp.Width),
+               LONG(vp.TopLeftY + vp.Height)};
+  context_->RSSetScissorRects(1, &r);
+  context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  context_->IASetInputLayout(nullptr);
+  context_->VSSetShader(blit_vs_.get(), nullptr, 0);
+  context_->GSSetShader(nullptr, nullptr, 0);
+  context_->PSSetShader(shader ? shader : depth ? blit_depth_ps_.get() : blit_ps_.get(), nullptr, 0);
+  ID3D11Buffer* b = cb_blit_.get();
+  context_->VSSetConstantBuffers(0, 1, &b);
+  context_->PSSetConstantBuffers(0, 1, &b);
+  context_->PSSetShaderResources(0, 1, &src);
+  ID3D11SamplerState* s = point ? point_clamp_.get() : linear_clamp_.get();
+  context_->PSSetSamplers(0, 1, &s);
+  context_->Draw(3, 0);
+  context_->PSSetShaderResources(0, 32, null_srvs);
+}
+
+
+// MSAA: what a resolve reads from a multisampled target, refreshed at each call: color is the
+// average of the samples (ResolveSubresource), depth sample 0 as a 32-bit float texture.
+#if PORT_GAME == PORT_GAME_COPA2014
+// With part, only that rectangle of a color target is brought up to date; the copy stays stale.
+ID3D11ShaderResourceView* RendererImpl::SingleSampleSrv(RenderTarget& rt, const D3D11_RECT* part) {
+#else /* street4 wc2010 */
+ID3D11ShaderResourceView* RendererImpl::SingleSampleSrv(RenderTarget& rt) {
+#endif /* PORT_GAME */
+  if (rt.samples <= 1) return rt.srv.get();
+#if PORT_GAME == PORT_GAME_COPA2014
+  static const bool no_reuse = std::getenv("COPA_NO_SINGLE_REUSE") != nullptr;  // A/B
+#elif PORT_GAME == PORT_GAME_WC2010
+  static const bool no_reuse = std::getenv("WC2010_NO_SINGLE_REUSE") != nullptr;  // A/B
+#else /* street4 */
+  static const bool no_reuse = std::getenv("STREET4_NO_SINGLE_REUSE") != nullptr;  // A/B
+#endif /* PORT_GAME */
+  if (rt.single && !rt.single_stale && rt.single_epoch == tile_depth_clear_epoch_ && !no_reuse) {
+    ++single_reused_;
+    return rt.single_srv.get();
+  }
+#if PORT_GAME == PORT_GAME_COPA2014
+  part = !rt.depth && blit_color_ms_ps_ ? part : nullptr;
+  if (!part) {
+    ++single_copied_;
+    rt.single_stale = false;
+    rt.single_epoch = tile_depth_clear_epoch_;
+  }
+#else /* street4 wc2010 */
+  ++single_copied_;
+  rt.single_stale = false;
+  rt.single_epoch = tile_depth_clear_epoch_;
+#endif /* PORT_GAME */
+  D3D11_TEXTURE2D_DESC td;
+  rt.texture->GetDesc(&td);
+  const DXGI_FORMAT format = td.Format;
+  if (!rt.single) {
+    td.SampleDesc = {1, 0};
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+#if PORT_GAME == PORT_GAME_COPA2014
+    td.BindFlags |= D3D11_BIND_RENDER_TARGET;
+    if (rt.depth) td.Format = DXGI_FORMAT_R32_FLOAT;
+#else /* street4 wc2010 */
+    if (rt.depth) {
+      td.Format = DXGI_FORMAT_R32_FLOAT;
+      td.BindFlags |= D3D11_BIND_RENDER_TARGET;
+    }
+#endif /* PORT_GAME */
+    if (FAILED(device_->CreateTexture2D(&td, nullptr, rt.single.put()))) return nullptr;
+    device_->CreateShaderResourceView(rt.single.get(), nullptr, rt.single_srv.put());
+#if PORT_GAME == PORT_GAME_COPA2014
+    device_->CreateRenderTargetView(rt.single.get(), nullptr, rt.single_rtv.put());
+#else /* street4 wc2010 */
+    if (rt.depth) device_->CreateRenderTargetView(rt.single.get(), nullptr, rt.single_rtv.put());
+#endif /* PORT_GAME */
+  }
+#if PORT_GAME == PORT_GAME_COPA2014
+  if (part) {
+    ++rect_resolves_;
+    D3D11_VIEWPORT vp{float(part->left), float(part->top), float(part->right - part->left),
+                      float(part->bottom - part->top), 0, 1};
+    BlitTo(rt.single_rtv.get(), td.Width, td.Height, vp, rt.srv.get(), 1, 1, 0, 0, 1, 1, false, false, true,
+           blit_color_ms_ps_.get());
+  } else if (rt.depth) {
+#else /* street4 wc2010 */
+  if (rt.depth) {
+#endif /* PORT_GAME */
+    D3D11_VIEWPORT vp{0, 0, float(td.Width), float(td.Height), 0, 1};
+    BlitTo(rt.single_rtv.get(), td.Width, td.Height, vp, rt.srv.get(), 1, 1, 0, 0, 1, 1, true, false, true,
+           blit_depth_ms_ps_.get());
+  } else {
+    context_->ResolveSubresource(rt.single.get(), 0, rt.texture.get(), 0, format);
+  }
+  return rt.single_srv.get();
+}
+
+// Internal resolution: the region of a scaled resolve result drawn at guest size, into a texture
+// kept per destination (tiled frames add their rectangles to the same one).
+ID3D11Texture2D* RendererImpl::GuestSizeCopy(const ResolvedTexture& r, uint32_t key, int32_t x, int32_t y,
+                                             int32_t w, int32_t h) {
+  D3D11_TEXTURE2D_DESC td;
+  r.texture->GetDesc(&td);
+  auto& copy = writeback_scratch_[key];
+  D3D11_TEXTURE2D_DESC cur{};
+  if (copy.first) copy.first->GetDesc(&cur);
+  if (!copy.first || cur.Format != td.Format || cur.Width != r.width || cur.Height != r.height) {
+    D3D11_TEXTURE2D_DESC sd{r.width, r.height, 1, 1, td.Format, {1, 0}, D3D11_USAGE_DEFAULT,
+                            D3D11_BIND_RENDER_TARGET, 0, 0};
+    copy = {};
+    if (FAILED(device_->CreateTexture2D(&sd, nullptr, copy.first.put())) ||
+        FAILED(device_->CreateRenderTargetView(copy.first.get(), nullptr, copy.second.put())))
+      return nullptr;
+  }
+  w = std::min<int32_t>(w, int32_t(r.width) - x);
+  h = std::min<int32_t>(h, int32_t(r.height) - y);
+  if (w <= 0 || h <= 0) return nullptr;
+  D3D11_VIEWPORT vp{float(x), float(y), float(w), float(h), 0, 1};
+  // Data formats (depth, float channels) keep exact texels; colors are filtered.
+  bool point = td.Format == DXGI_FORMAT_R32_FLOAT || td.Format == DXGI_FORMAT_R32G32_FLOAT ||
+               td.Format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+  float gw = float(r.width), gh = float(r.height);
+  BlitTo(copy.second.get(), r.width, r.height, vp, r.srv.get(), gw, gh, x / gw, y / gh, (x + w) / gw,
+         (y + h) / gh, false, false, point);
+  return copy.first.get();
+}
+
+// The GPU writes resolve results to memory (tiled, in the copy-destination endian); the game
+// reads some of them with the CPU (it compresses render-to-texture lightmaps and environment
+// maps into DXT textures at load time). The result is copied to a staging texture here and
+// stored in guest memory one frame later, or as soon as the CPU waits for the GPU.
+void RendererImpl::QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, uint32_t dest_pitch,
+                                  uint32_t endian, int32_t x, int32_t y, int32_t w, int32_t h,
+                                  uint32_t fence) {
+  D3D11_TEXTURE2D_DESC td;
+  r.texture->GetDesc(&td);
+  uint32_t bpp;
+  switch (td.Format) {
+    case DXGI_FORMAT_R8_UNORM: bpp = 1; break;
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_FLOAT: bpp = 2; break;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R32_FLOAT: bpp = 4; break;
+    case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R32G32_FLOAT: bpp = 8; break;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: bpp = 16; break;
+    default: return;  // host layout differs from the guest one
+  }
+  if (r.format == 63) return;  // 7e3 float stored as half on the host
+#if PORT_GAME == PORT_GAME_COPA2014
+#elif PORT_GAME == PORT_GAME_WC2010
+  // Diagnostics: WC2010_WB_SKIP=<w>x<h>[,...] keeps results of those sizes out of guest memory.
+  if (static const char* skip = std::getenv("WC2010_WB_SKIP"); skip && *skip) {
+    std::string list = std::string(",") + skip + ",";
+    if (list.find(fmt::format(",{}x{},", w, h)) != std::string::npos) return;
+  }
+  // 4_4_4_4 destinations are RGBA8 on the host: packed back to 16-bit texels when stored.
+#else /* street4 */
+  // Diagnostics: STREET4_WB_SKIP=<w>x<h>[,...] keeps results of those sizes out of guest memory.
+  if (static const char* skip = std::getenv("STREET4_WB_SKIP"); skip && *skip) {
+    std::string list = std::string(",") + skip + ",";
+    if (list.find(fmt::format(",{}x{},", w, h)) != std::string::npos) return;
+  }
+  // 4_4_4_4 destinations are RGBA8 on the host: packed back to 16-bit texels when stored.
+#endif /* PORT_GAME */
+  const bool pack4444 = r.format == 15 && td.Format == DXGI_FORMAT_R8G8B8A8_UNORM;
+  if (pack4444) bpp = 2;
+  x = std::max(x, 0);
+  y = std::max(y, 0);
+  w = std::min<int32_t>(w, int32_t(std::min<uint32_t>(td.Width, r.width)) - x);
+  h = std::min<int32_t>(h, int32_t(std::min<uint32_t>(td.Height, r.height)) - y);
+  if (w <= 0 || h <= 0) return;
+  // Destinations resolved in every frame (the scene, post-processing chains) are render targets
+  // the GPU reads back; the CPU reads what is generated once (lightmaps at load time). Steady
+#if PORT_GAME == PORT_GAME_COPA2014
+  // destinations are stored when the CPU touches them (or, when it polls them every frame, copied
+  // once a second), and never force a GPU sync at a fence wait.
+#else /* street4 wc2010 */
+  // destinations reach memory once a second at the frame-late drain. The results in between are
+  // still queued: a fence wait stores those the CPU waits for. The load-time lightmap bake
+  // resolves to the same two destinations in every frame for hundreds of frames, and the CPU
+  // compresses each finished lightmap right after a fence wait; without its result the CPU read
+  // whatever an earlier depth resolve left there (the crowd and stands turned red).
+#endif /* PORT_GAME */
+  WriteBackHistory& hist = writeback_history_[dest_base & 0x1FFFFFFF];
+  if (hist.last_frame != frame_) {
+    // (within 3 frames: double-buffered targets alternate between two destinations)
+    hist.streak = hist.last_frame != ~0ull && frame_ - hist.last_frame <= 3 ? hist.streak + 1 : 0;
+    hist.last_frame = frame_;
+  }
+#if PORT_GAME == PORT_GAME_COPA2014
+  static const bool no_steady = std::getenv("COPA_NO_STEADY") != nullptr;  // diagnostics
+  const bool steady = hist.streak >= 4 && !no_steady;
+  static const bool no_ondemand = std::getenv("COPA_NO_ONDEMAND") != nullptr;  // diagnostics
+  if (steady && !no_ondemand) {
+#elif PORT_GAME == PORT_GAME_WC2010
+  static const bool no_steady_od = std::getenv("WC2010_NO_ONDEMAND") != nullptr;  // A/B
+  const bool steady = hist.streak >= 4;
+  if (steady && !no_steady_od) {
+#else /* street4 */
+  static const bool no_steady_od = std::getenv("STREET4_NO_ONDEMAND") != nullptr;  // A/B
+  const bool steady = hist.streak >= 4;
+  if (steady && !no_steady_od) {
+#endif /* PORT_GAME */
+    // A steady destination can still be generated content the CPU reads once, after the last
+    // pass (lightmaps rendered over several frames at load time, then DXT-compressed): store it
+#if PORT_GAME == PORT_GAME_COPA2014
+    // when the CPU actually touches it.
+#else /* street4 wc2010 */
+    // when the CPU actually touches it. Nothing is copied until then, not even at guest size;
+    // those copies were the biggest cost of a 4K frame.
+#endif /* PORT_GAME */
+    std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+    uint32_t base = dest_base & 0x1FFFFFFF;
+    OnDemandWriteBack& od = ondemand_[base];
+#if PORT_GAME == PORT_GAME_COPA2014
+#else /* street4 wc2010 */
+    // Reads that started at the image were a bake in progress (a pass per frame, each result
+    // compressed by the CPU), which ends: try on-demand again.
+    if (od.cpu_polled && !od.reads_value && frame_ - od.polled_frame > 300) {
+      od.cpu_polled = false;
+      od.close_faults = 0;
+    }
+#endif /* PORT_GAME */
+    if (!od.cpu_polled) {
+      // Tiled frames resolve one destination in several rectangles: keep their union.
+      int32_t x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+      if (od.dirty && od.texture.get() == r.texture.get()) {
+        x0 = std::min(x0, od.x);
+        y0 = std::min(y0, od.y);
+        x1 = std::max(x1, od.x + od.w);
+        y1 = std::max(y1, od.y + od.h);
+      }
+      uint32_t extent = ((dest_pitch + 31) & ~31u) * ((uint32_t(y1) + 31) & ~31u) * bpp;
+      uint32_t first = (base + 0xFFF) & ~0xFFFu, end = std::min(base + extent, 0x20000000u) & ~0xFFFu;
+      if (od.protected_pages && (od.first_page != first || od.end_page != end)) {
+        ProtectOnDemand(od, PAGE_READWRITE);
+        od.protected_pages = false;
+      }
+      if (end > first) {
+        od.texture.reset();
+        od.srv.reset();
+        r.texture.get()->AddRef();
+        od.texture.p = r.texture.get();
+        r.srv.get()->AddRef();
+        od.srv.p = r.srv.get();
+        od.width = r.width;
+        od.height = r.height;
+        od.scale = r.scale;
+        od.dest_base = base;
+        od.dest_pitch = dest_pitch;
+        od.endian = endian;
+        od.bpp = bpp;
+        od.pack4444 = pack4444;
+        od.x = x0;
+        od.y = y0;
+        od.w = x1 - x0;
+        od.h = y1 - y0;
+        od.first_page = first;
+        od.end_page = end;
+        od.dirty = true;
+        od.last_resolve_frame = frame_;
+        if (!od.protected_pages) {
+          od.protected_pages = ProtectOnDemand(od, PAGE_NOACCESS);
+          static int logs = 0;
+          if (logs++ < 40)
+#if PORT_GAME == PORT_GAME_COPA2014
+            REXLOG_INFO("copa resolve on-demand: {:08X} pages {:08X}-{:08X} protected={}", base, first, end,
+#elif PORT_GAME == PORT_GAME_WC2010
+            REXLOG_INFO("wc2010 resolve on-demand: {:08X} pages {:08X}-{:08X} protected={}", base, first, end,
+#else /* street4 */
+            REXLOG_INFO("street4 resolve on-demand: {:08X} pages {:08X}-{:08X} protected={}", base, first, end,
+#endif /* PORT_GAME */
+                        od.protected_pages);
+        }
+        if (od.protected_pages) return;
+      }
+    }
+  }
+  if (!steady) {
+    // The queued copy below stores this result; an older on-demand one must not replace it.
+    std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+    if (auto it = ondemand_.find(dest_base & 0x1FFFFFFF); it != ondemand_.end() && it->second.protected_pages) {
+      ProtectOnDemand(it->second, PAGE_READWRITE);
+      it->second.protected_pages = false;
+      it->second.dirty = false;
+    }
+  }
+#if PORT_GAME == PORT_GAME_COPA2014
+  if (steady && hist.queued_frame != frame_ && frame_ - hist.queued_frame < 60) return;
+  hist.queued_frame = frame_;
+#elif PORT_GAME == PORT_GAME_WC2010
+  // Each destination has its own slot in the once-a-second cycle: storing all the full-screen
+  // chains in the same frame took 6-10 ms of that frame (~2 ms each). A 4-frame window catches
+  // targets resolved every other frame. WC2010_NO_WRITEBACK_STAGGER=1 restores one shared slot.
+  static const bool no_stagger = std::getenv("WC2010_NO_WRITEBACK_STAGGER") != nullptr;
+  const uint32_t phase = no_stagger ? 0 : (((dest_base & 0x1FFFFFFF) >> 12) * 2654435761u) >> 26;
+  const bool due = no_stagger ? frame_ - hist.queued_frame >= 60
+                              : ((frame_ + phase) % 60 < 4 && frame_ - hist.queued_frame >= 4) ||
+                                    frame_ - hist.queued_frame >= 120;
+  const bool throttled = steady && hist.queued_frame != frame_ && !due;
+  if (!throttled) hist.queued_frame = frame_;
+  // A destination the CPU reads one value from every frame (exposure) lives on the periodic copy;
+  // the copies in between would be thrown away, and they cost as much as the frame's post effects.
+  if (throttled) {
+    std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+    auto it = ondemand_.find(dest_base & 0x1FFFFFFF);
+    if (it != ondemand_.end() && it->second.cpu_polled && it->second.reads_value) return;
+  }
+#else /* street4 */
+  // Each destination has its own slot in the once-a-second cycle: storing all the full-screen
+  // chains in the same frame took 6-10 ms of that frame (~2 ms each). A 4-frame window catches
+  // targets resolved every other frame. STREET4_NO_WRITEBACK_STAGGER=1 restores one shared slot.
+  static const bool no_stagger = std::getenv("STREET4_NO_WRITEBACK_STAGGER") != nullptr;
+  const uint32_t phase = no_stagger ? 0 : (((dest_base & 0x1FFFFFFF) >> 12) * 2654435761u) >> 26;
+  const bool due = no_stagger ? frame_ - hist.queued_frame >= 60
+                              : ((frame_ + phase) % 60 < 4 && frame_ - hist.queued_frame >= 4) ||
+                                    frame_ - hist.queued_frame >= 120;
+  const bool throttled = steady && hist.queued_frame != frame_ && !due;
+  if (!throttled) hist.queued_frame = frame_;
+  // A destination the CPU reads one value from every frame (exposure) lives on the periodic copy;
+  // the copies in between would be thrown away, and they cost as much as the frame's post effects.
+  if (throttled) {
+    std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+    auto it = ondemand_.find(dest_base & 0x1FFFFFFF);
+    if (it != ondemand_.end() && it->second.cpu_polled && it->second.reads_value) return;
+  }
+#endif /* PORT_GAME */
+  // Internal resolution: everything below works on a guest-size copy of the result.
+  ID3D11Texture2D* source = r.texture.get();
+  if (r.scale != 1.0f) {
+    source = GuestSizeCopy(r, dest_base & 0x1FFFFFFF, x, y, w, h);
+    if (!source) return;
+    source->GetDesc(&td);
+  }
+  Com<ID3D11Texture2D> staging;
+  for (auto it = staging_pool_.begin(); it != staging_pool_.end(); ++it) {
+    D3D11_TEXTURE2D_DESC sd;
+    (*it)->GetDesc(&sd);
+    if (sd.Format == td.Format && sd.Width == UINT(w) && sd.Height == UINT(h)) {
+      staging = std::move(*it);
+      staging_pool_.erase(it);
+      break;
+    }
+  }
+  if (!staging) {
+    D3D11_TEXTURE2D_DESC sd{UINT(w), UINT(h), 1, 1, td.Format, {1, 0}, D3D11_USAGE_STAGING, 0,
+                            D3D11_CPU_ACCESS_READ, 0};
+    if (FAILED(device_->CreateTexture2D(&sd, nullptr, staging.put()))) return;
+  }
+  D3D11_BOX box{UINT(x), UINT(y), 0, UINT(x + w), UINT(y + h), 1};
+  context_->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, source, 0, &box);
+  writebacks_.push_back(
+      {std::move(staging), dest_base & 0x1FFFFFFF, dest_pitch, endian, bpp, x, y, w, h, frame_, fence,
+#if PORT_GAME == PORT_GAME_COPA2014
+       steady, pack4444, MemorySnapshot(dest_base, dest_pitch, bpp, y, h)});
+#else /* street4 wc2010 */
+       steady, throttled, pack4444, MemorySnapshot(dest_base, dest_pitch, bpp, y, h)});
+#endif /* PORT_GAME */
+  ++writebacks_by_address_[dest_base & 0x1FFFFFFF];
+}
+
+// The CPU views of physical memory (64 KB, 16 MB and 4 KB pages; the last one is offset by a
+// page on hosts with 64 KB allocation granularity, see GuestPtr).
+bool RendererImpl::ProtectOnDemand(const OnDemandWriteBack& od, DWORD protect) {
+  bool any = false;
+  for (uint32_t view : {0xA0000000u, 0xC0000000u, 0xE0000000u}) {
+    DWORD old;
+    any |= VirtualProtect(GuestPtr(membase_, view | od.first_page), od.end_page - od.first_page, protect, &old) != 0;
+  }
+  return any;
+}
+
+// Stores the latest result of an on-demand destination now (stalls on the GPU). Called with the
+// renderer's API lock held, also from the CPU thread that touched the memory.
+void RendererImpl::StoreOnDemand(OnDemandWriteBack& od) {
+  std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+  if (!od.dirty || !od.texture) return;
+  ID3D11Texture2D* source = od.texture.get();
+  if (od.scale != 1.0f) {
+    ResolvedTexture r;
+    r.width = od.width;
+    r.height = od.height;
+    r.scale = od.scale;
+    r.texture.p = od.texture.p;
+    r.srv.p = od.srv.p;
+    source = GuestSizeCopy(r, od.dest_base, od.x, od.y, od.w, od.h);
+    r.texture.p = nullptr;  // borrowed from od
+    r.srv.p = nullptr;
+    if (!source) return;
+  }
+  D3D11_TEXTURE2D_DESC td;
+  source->GetDesc(&td);
+  D3D11_TEXTURE2D_DESC sd{UINT(od.w), UINT(od.h), 1, 1, td.Format, {1, 0}, D3D11_USAGE_STAGING, 0,
+                          D3D11_CPU_ACCESS_READ, 0};
+  Com<ID3D11Texture2D> staging;
+  D3D11_MAPPED_SUBRESOURCE m;
+  if (SUCCEEDED(device_->CreateTexture2D(&sd, nullptr, staging.put()))) {
+    D3D11_BOX box{UINT(od.x), UINT(od.y), 0, UINT(od.x + od.w), UINT(od.y + od.h), 1};
+    context_->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, source, 0, &box);
+    if (SUCCEEDED(context_->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m))) {
+      StoreTiled(static_cast<const uint8_t*>(m.pData), m.RowPitch, od.dest_base, od.dest_pitch, od.endian, od.bpp,
+                 od.x, od.y, od.w, od.h, od.pack4444);
+      context_->Unmap(staging.get(), 0);
+    }
+  }
+  od.dirty = false;
+  od.stored_hash = Hash64(Physical(od.dest_base), 4096);
+  od.has_stored_hash = true;
+  static std::atomic<int> logs{0};
+  if (logs++ < 40)
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_INFO("copa resolve on-demand store: {:08X} {}x{} at ({},{}) frame {}", od.dest_base, od.w, od.h, od.x,
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_INFO("wc2010 resolve on-demand store: {:08X} {}x{} at ({},{}) frame {}", od.dest_base, od.w, od.h, od.x,
+#else /* street4 */
+    REXLOG_INFO("street4 resolve on-demand store: {:08X} {}x{} at ({},{}) frame {}", od.dest_base, od.w, od.h, od.x,
+#endif /* PORT_GAME */
+                od.y, frame_);
+}
+
+// Once a destination is no longer resolved its memory may be handed to something else (file
+// reads into it would fail on protected pages): its final result is stored and the pages opened.
+void RendererImpl::ExpireOnDemand() {
+  std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+  for (auto& [base, od] : ondemand_) {
+    if (!od.protected_pages || frame_ - od.last_resolve_frame <= 4) continue;
+    StoreOnDemand(od);
+    ProtectOnDemand(od, PAGE_READWRITE);
+    od.protected_pages = false;
+    od.texture.reset();
+    od.srv.reset();
+  }
+}
+
+// Whether guest memory at `base` is exactly what an on-demand store left there (the host copy of
+// the resolve then stays authoritative, as after a queued write-back).
+bool RendererImpl::OnDemandStored(uint32_t base, uint64_t guest_hash) {
+  std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+  auto it = ondemand_.find(base);
+  return it != ondemand_.end() && it->second.has_stored_hash && it->second.stored_hash == guest_hash;
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+bool RendererImpl::OnDemandCovers(const OnDemandWriteBack& od, uintptr_t host_address) {
+#else /* street4 wc2010 */
+bool RendererImpl::OnDemandCovers(const OnDemandWriteBack& od, uintptr_t host_address, uint32_t* offset) {
+#endif /* PORT_GAME */
+  if (!od.protected_pages) return false;
+  for (uint32_t view : {0xA0000000u, 0xC0000000u, 0xE0000000u}) {
+    uintptr_t first = reinterpret_cast<uintptr_t>(GuestPtr(membase_, view | od.first_page));
+#if PORT_GAME == PORT_GAME_COPA2014
+    if (host_address >= first && host_address < first + (od.end_page - od.first_page)) return true;
+#else /* street4 wc2010 */
+    if (host_address >= first && host_address < first + (od.end_page - od.first_page)) {
+      if (offset) *offset = uint32_t(host_address - first);
+      return true;
+    }
+#endif /* PORT_GAME */
+  }
+  return false;
+}
+
+bool RendererImpl::HandleOnDemandFault(uintptr_t host_address) {
+  // Most faults are the memory system's own write watches: they must not wait for the renderer.
+  {
+    std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+    bool mine = false;
+    for (auto& [base, od] : ondemand_) mine |= OnDemandCovers(od, host_address);
+    if (!mine) return false;
+  }
+  // The store draws and copies with the immediate context, so it waits its turn like any API call.
+  ApiLock api(ApiMutex());
+  std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+  for (auto& [base, od] : ondemand_) {
+#if PORT_GAME == PORT_GAME_COPA2014
+    if (!OnDemandCovers(od, host_address)) continue;
+#else /* street4 wc2010 */
+    uint32_t offset = 0;
+    if (!OnDemandCovers(od, host_address, &offset)) continue;
+#endif /* PORT_GAME */
+    StoreOnDemand(od);  // through the physical view, before other threads see the pages open
+    ProtectOnDemand(od, PAGE_READWRITE);
+    od.protected_pages = false;
+    // A destination the CPU reads back nearly every frame (exposure, occlusion data) goes back
+    // to periodic copies: storing it on access would stall on the GPU every frame.
+    uint64_t frame = frame_;
+    od.close_faults = frame - od.last_fault_frame <= 3 ? od.close_faults + 1 : 0;
+#if PORT_GAME == PORT_GAME_COPA2014
+#else /* street4 wc2010 */
+    od.reads_value = (od.close_faults == 0 || od.reads_value) && offset != 0;
+#endif /* PORT_GAME */
+    od.last_fault_frame = frame;
+    if (od.close_faults >= 3) {
+      od.cpu_polled = true;
+#if PORT_GAME == PORT_GAME_COPA2014
+#else /* street4 wc2010 */
+      od.polled_frame = frame;
+#endif /* PORT_GAME */
+      od.texture.reset();
+      od.srv.reset();
+    }
+    return true;
+  }
+  return true;  // another thread stored it first
+}
+
+#if PORT_GAME == PORT_GAME_COPA2014
+// Stores rows of resolved texels (host order) at their tiled guest locations, in the copy endian.
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+void RendererImpl::StoreTiled(const uint8_t* data, uint32_t row_pitch, uint32_t dest_base, uint32_t dest_pitch,
+                              uint32_t endian, uint32_t bpp, int32_t x, int32_t y, int32_t w, int32_t h,
+                              bool pack4444) {
+  uint8_t* mem = const_cast<uint8_t*>(Physical(0));
+  const uint32_t src_bpp = pack4444 ? 4 : bpp;
+  uint8_t packed[16];
+  uint32_t log2_bpp = bpp == 1 ? 0 : bpp == 2 ? 1 : bpp == 4 ? 2 : bpp == 8 ? 3 : 4;
+  uint32_t pitch = (dest_pitch + 31) & ~31u;
+  // Runs of texels that stay contiguous in the tiled layout (16 bytes, up to 8 texels).
+  const int32_t run = int32_t(std::max<uint32_t>(1, std::min<uint32_t>(8, 16u >> log2_bpp)));
+  for (int32_t row = 0; row < h; ++row) {
+    const uint8_t* src_row = data + size_t(row) * row_pitch;
+    int32_t py = y + row;
+    for (int32_t col = 0; col < w;) {
+      int32_t px = x + col;
+      int32_t n = std::min(run - (px & (run - 1)), w - col);
+      uint32_t off = dest_base + uint32_t(TiledOffset2DInline(px, py, pitch, log2_bpp));
+      uint32_t bytes = uint32_t(n) * bpp;
+      // Common case (whole 16-byte run of 32-bit texels): no per-byte loop.
+      if (bytes == 16 && bpp == 4 && !pack4444 && off + 16 <= 0x20000000u && (endian == 0 || endian == 2)) {
+        uint32_t v[4];
+        std::memcpy(v, src_row + size_t(col) * 4, 16);
+        if (endian == 2)
+          for (uint32_t& t : v) t = native_host::ByteSwap32(t);
+        std::memcpy(mem + off, v, 16);
+        col += n;
+        continue;
+      }
+      if (off + bytes <= 0x20000000u) {
+        const uint8_t* src = src_row + size_t(col) * src_bpp;
+        if (pack4444) {
+          // Channel c in bits 4c..4c+3 (as the texture loader reads 4_4_4_4).
+          for (int32_t i = 0; i < n; ++i) {
+            uint16_t v = 0;
+            for (int c = 0; c < 4; ++c) v |= uint16_t((src[i * 4 + c] * 15 + 127) / 255) << (4 * c);
+            packed[i * 2] = uint8_t(v);
+            packed[i * 2 + 1] = uint8_t(v >> 8);
+          }
+          src = packed;
+        }
+        uint8_t* dst = mem + off;
+        if (endian == 0 || bpp == 1) {
+          std::memcpy(dst, src, bytes);
+        } else if (bpp == 2 || endian == 1) {  // 8in16
+          for (uint32_t i = 0; i < bytes; i += 2) {
+            dst[i] = src[i + 1];
+            dst[i + 1] = src[i];
+          }
+        } else if (endian == 2) {  // 8in32
+          for (uint32_t i = 0; i < bytes; i += 4) {
+            uint32_t v;
+            std::memcpy(&v, src + i, 4);
+            v = native_host::ByteSwap32(v);
+            std::memcpy(dst + i, &v, 4);
+          }
+        } else {  // 16in32
+          for (uint32_t i = 0; i < bytes; i += 4) {
+            dst[i] = src[i + 2];
+            dst[i + 1] = src[i + 3];
+            dst[i + 2] = src[i];
+            dst[i + 3] = src[i + 1];
+          }
+        }
+      }
+      col += n;
+    }
+  }
+}
+
+void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
+  RenderPhase profile(RenderProfile::WriteBack);
+#if PORT_GAME == PORT_GAME_COPA2014
+#else /* street4 wc2010 */
+  uint8_t* mem = const_cast<uint8_t*>(Physical(0));
+#endif /* PORT_GAME */
+  // Cost accounting, logged every 600 frames.
+  static uint64_t stat_ns = 0, stat_bytes = 0, stat_stored = 0, stat_skipped = 0, stat_forced = 0,
+                  stat_frame = 0;
+  auto stat_start = std::chrono::steady_clock::now();
+  struct StatScope {
+    std::chrono::steady_clock::time_point start;
+    ~StatScope() {
+      stat_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - start).count());
+    }
+  } stat_scope{stat_start};
+  if (frame_ >= stat_frame + 600) {
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_INFO("copa resolve write-back: {:.1f} ms/frame, {} KB/frame, stored={} skipped={} forced={}",
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_INFO("wc2010 resolve write-back: {:.1f} ms/frame, {} KB/frame, stored={} skipped={} forced={}",
+#else /* street4 */
+    REXLOG_INFO("street4 resolve write-back: {:.1f} ms/frame, {} KB/frame, stored={} skipped={} forced={}",
+#endif /* PORT_GAME */
+                stat_ns / 1e6 / double(frame_ - stat_frame), stat_bytes / 1024 / (frame_ - stat_frame),
+                stat_stored, stat_skipped, stat_forced);
+    stat_ns = stat_bytes = stat_stored = stat_skipped = stat_forced = 0;
+    stat_frame = frame_;
+  }
+  // A wait for `fence` needs the results of the work issued up to it: resolves queued while the
+#if PORT_GAME == PORT_GAME_COPA2014
+  // library's timestamp was `fence` are needed too (the game reads them after that wait).
+  // Steady destinations wait for the frame-late drain (mapping them right after the copy would
+  // stall on the GPU).
+#else /* street4 wc2010 */
+  // library's timestamp was `fence` are needed too (the game reads them after that wait). That
+  // includes steady destinations: the CPU may be waiting precisely for one of them.
+#endif /* PORT_GAME */
+  for (size_t i = 0; i < writebacks_.size();) {
+    const PendingWriteBack& f = writebacks_[i];
+    if (all ? int32_t(f.fence - fence) > 0 : f.frame >= frame_) break;
+#if PORT_GAME == PORT_GAME_COPA2014
+    if (all && f.steady) {
+      ++i;
+      continue;
+    }
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+    // At the frame-late drain nobody waits for these results: when the GPU has not finished the
+#if PORT_GAME == PORT_GAME_COPA2014
+    // copy yet, leave them for a later frame (at most 4) instead of stalling on Map.
+    static const bool no_async = std::getenv("COPA_NO_ASYNC_WRITEBACK") != nullptr;
+    if (!all && !no_async && frame_ - f.frame < 4) {
+#elif PORT_GAME == PORT_GAME_WC2010
+    // copy yet, leave them for a later frame instead of stalling on Map (a ~6 ms hitch once per
+    // second with the steady copies). Fence waits (all) still block, the CPU reads after them.
+    // The same for the once-a-second copy of a steady destination at a fence wait for an earlier
+    // frame (frame pacing): only results of the current frame are what such a wait is for.
+    static const bool no_async = std::getenv("WC2010_NO_ASYNC_WRITEBACK") != nullptr;
+    const bool deferrable = all ? f.steady && f.frame < frame_ : true;
+    if (!no_async && deferrable && frame_ - f.frame < 4) {
+#else /* street4 */
+    // copy yet, leave them for a later frame instead of stalling on Map (a ~6 ms hitch once per
+    // second with the steady copies). Fence waits (all) still block, the CPU reads after them.
+    // The same for the once-a-second copy of a steady destination at a fence wait for an earlier
+    // frame (frame pacing): only results of the current frame are what such a wait is for.
+    static const bool no_async = std::getenv("STREET4_NO_ASYNC_WRITEBACK") != nullptr;
+    const bool deferrable = all ? f.steady && f.frame < frame_ : true;
+    if (!no_async && deferrable && frame_ - f.frame < 4) {
+#endif /* PORT_GAME */
+      D3D11_MAPPED_SUBRESOURCE probe;
+      if (context_->Map(f.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &probe) ==
+#if PORT_GAME == PORT_GAME_COPA2014
+          DXGI_ERROR_WAS_STILL_DRAWING)
+        break;
+#else /* street4 wc2010 */
+          DXGI_ERROR_WAS_STILL_DRAWING) {
+        if (!all) break;
+        ++i;
+        continue;
+      }
+#endif /* PORT_GAME */
+      context_->Unmap(f.staging.get(), 0);
+    }
+    PendingWriteBack p = std::move(writebacks_[i]);
+    writebacks_.erase(writebacks_.begin() + i);
+    // Results the GPU overwrites every frame (post-processing chains, the scene) are already
+    // superseded by a resolve of the same rectangle in a later frame; storing each of them would
+    // cost more than the frame, so they reach memory every few frames. Resolves of the same
+    // frame (content generated at load time, read back by the CPU one after another) are kept.
+    bool superseded = false;
+#if PORT_GAME == PORT_GAME_COPA2014
+#else /* street4 wc2010 */
+    // (at a fence wait, only by a result that is stored in this same wait)
+#endif /* PORT_GAME */
+    for (const auto& q : writebacks_)
+      if (q.frame > p.frame && q.dest_base == p.dest_base && q.x <= p.x && q.y <= p.y &&
+#if PORT_GAME == PORT_GAME_COPA2014
+          q.x + q.w >= p.x + p.w && q.y + q.h >= p.y + p.h) {
+#else /* street4 wc2010 */
+          q.x + q.w >= p.x + p.w && q.y + q.h >= p.y + p.h && (!all || int32_t(q.fence - fence) <= 0)) {
+#endif /* PORT_GAME */
+        superseded = true;
+        break;
+      }
+    uint64_t& last_stored = writeback_last_stored_[p.dest_base];
+#if PORT_GAME == PORT_GAME_COPA2014
+    bool store = !superseded || frame_ - last_stored >= 8;
+#else /* street4 wc2010 */
+    // Throttled steady results are stored only when the CPU waits for them in the frame they were
+    // resolved in (the lightmap bake reads each result right away); waits for the previous frame
+    // (frame pacing, in every frame) do not store the scene and post-processing chains again.
+    bool store = (all ? !p.throttled || p.frame == frame_ : !p.throttled) &&
+                 (!superseded || frame_ - last_stored >= 8);
+#endif /* PORT_GAME */
+    // A later resolve of the same frame covering this rectangle, completed before this same wait
+    // (or drain), is stored right after it: nothing can read this one in between.
+#if PORT_GAME == PORT_GAME_COPA2014
+    static const bool no_dedupe = std::getenv("COPA_NO_WRITEBACK_DEDUPE") != nullptr;
+#elif PORT_GAME == PORT_GAME_WC2010
+    static const bool no_dedupe = std::getenv("WC2010_NO_WRITEBACK_DEDUPE") != nullptr;
+#else /* street4 */
+    static const bool no_dedupe = std::getenv("STREET4_NO_WRITEBACK_DEDUPE") != nullptr;
+#endif /* PORT_GAME */
+    if (store && !no_dedupe)
+      for (size_t k = i; k < writebacks_.size(); ++k) {
+        const auto& q = writebacks_[k];
+        if (all ? int32_t(q.fence - fence) > 0 : q.frame >= frame_) break;
+        if (q.frame == p.frame && q.dest_base == p.dest_base && q.x <= p.x && q.y <= p.y &&
+#if PORT_GAME == PORT_GAME_COPA2014
+            q.x + q.w >= p.x + p.w && q.y + q.h >= p.y + p.h && !(all && q.steady)) {
+#else /* street4 wc2010 */
+            q.x + q.w >= p.x + p.w && q.y + q.h >= p.y + p.h && q.throttled == p.throttled) {
+#endif /* PORT_GAME */
+          store = false;
+          break;
+        }
+      }
+#if PORT_GAME == PORT_GAME_COPA2014
+#elif PORT_GAME == PORT_GAME_WC2010
+    // Diagnostics: a stored result overlapping vertex data drawn in the last frames.
+    static const bool vb_check = std::getenv("WC2010_WB_VBCHECK") != nullptr;
+    if (vb_check && store) {
+      uint32_t extent = ((p.dest_pitch + 31) & ~31u) * ((uint32_t(p.y + p.h) + 31) & ~31u) * p.bpp;
+      static std::set<uint64_t> reported;
+      for (const auto& [key, vb] : vertex_buffers_) {
+        uint32_t vb_base = uint32_t(key), vb_bytes = uint32_t(key >> 32);
+        if (frame_ - vb->last_used > 2 || vb_base + vb_bytes <= p.dest_base || vb_base >= p.dest_base + extent) continue;
+        if (reported.insert((uint64_t(p.dest_base) << 32) | vb_base).second)
+          REXLOG_INFO("wc2010 write-back {:08X} {}x{} bpp={} (extent {:X}) overlaps vertex buffer {:08X}+{:X}",
+                      p.dest_base, p.w, p.h, p.bpp, extent, vb_base, vb_bytes);
+      }
+    }
+#else /* street4 */
+    // Diagnostics: a stored result overlapping vertex data drawn in the last frames.
+    static const bool vb_check = std::getenv("STREET4_WB_VBCHECK") != nullptr;
+    if (vb_check && store) {
+      uint32_t extent = ((p.dest_pitch + 31) & ~31u) * ((uint32_t(p.y + p.h) + 31) & ~31u) * p.bpp;
+      static std::set<uint64_t> reported;
+      for (const auto& [key, vb] : vertex_buffers_) {
+        uint32_t vb_base = uint32_t(key), vb_bytes = uint32_t(key >> 32);
+        if (frame_ - vb->last_used > 2 || vb_base + vb_bytes <= p.dest_base || vb_base >= p.dest_base + extent) continue;
+        if (reported.insert((uint64_t(p.dest_base) << 32) | vb_base).second)
+          REXLOG_INFO("street4 write-back {:08X} {}x{} bpp={} (extent {:X}) overlaps vertex buffer {:08X}+{:X}",
+                      p.dest_base, p.w, p.h, p.bpp, extent, vb_base, vb_bytes);
+      }
+    }
+#endif /* PORT_GAME */
+    // The CPU rewrote the destination after the resolve (the memory was reused): the late result
+    // would clobber its data.
+    static uint64_t clobbers_avoided = 0;
+    if (store && MemorySnapshot(p.dest_base, p.dest_pitch, p.bpp, p.y, p.h) != p.snapshot) {
+      store = false;
+      if (clobbers_avoided++ < 20 || (clobbers_avoided & 1023) == 0)
+#if PORT_GAME == PORT_GAME_COPA2014
+        REXLOG_INFO("copa write-back skipped: {:08X} {}x{} rewritten by the CPU since frame {} ({} so far)",
+#elif PORT_GAME == PORT_GAME_WC2010
+        REXLOG_INFO("wc2010 write-back skipped: {:08X} {}x{} rewritten by the CPU since frame {} ({} so far)",
+#else /* street4 */
+        REXLOG_INFO("street4 write-back skipped: {:08X} {}x{} rewritten by the CPU since frame {} ({} so far)",
+#endif /* PORT_GAME */
+                    p.dest_base, p.w, p.h, p.frame, clobbers_avoided);
+    }
+    if (store) last_stored = frame_;
+    ++(store ? stat_stored : stat_skipped);
+    if (all) ++stat_forced;
+    if (store) stat_bytes += uint64_t(p.w) * p.h * p.bpp;
+    D3D11_MAPPED_SUBRESOURCE m;
+    auto map_start = std::chrono::steady_clock::now();
+#if PORT_GAME == PORT_GAME_COPA2014
+    if (store && SUCCEEDED(context_->Map(p.staging.get(), 0, D3D11_MAP_READ, 0, &m))) {
+      StoreTiled(static_cast<const uint8_t*>(m.pData), m.RowPitch, p.dest_base, p.dest_pitch, p.endian, p.bpp,
+                 p.x, p.y, p.w, p.h, p.pack4444);
+#elif PORT_GAME == PORT_GAME_WC2010
+    bool mapped = store && SUCCEEDED(context_->Map(p.staging.get(), 0, D3D11_MAP_READ, 0, &m));
+    double map_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - map_start).count();
+    if (mapped) {
+      // Diagnostics: WC2010_DUMP_WB=<w>x<h>[,...] writes the first stored results of those sizes (host
+      // texel order, color and alpha) as BMPs to WC2010_WB_DIR.
+      // WC2010_WB_LOG=1: per-byte averages of small stored results (A/B comparisons).
+      static const bool wb_log = std::getenv("WC2010_WB_LOG") != nullptr;
+      static int wb_logs = 0;
+      if (wb_log && wb_logs < 600) {
+        ++wb_logs;
+        uint64_t sum[16] = {};
+        uint32_t step = std::max<uint32_t>(1, uint32_t(p.w * p.h) / 4096);
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < uint32_t(p.w * p.h); i += step, ++n) {
+          const uint8_t* s = static_cast<const uint8_t*>(m.pData) + size_t(i / p.w) * m.RowPitch +
+                             size_t(i % p.w) * (p.pack4444 ? 4 : p.bpp);
+          for (uint32_t b = 0; b < std::min<uint32_t>(p.bpp, 16); ++b) sum[b] += s[b];
+        }
+        std::string avg;
+        for (uint32_t b = 0; b < std::min<uint32_t>(p.bpp, 16); ++b) avg += fmt::format(" {}", n ? sum[b] / n : 0);
+        REXLOG_INFO("wc2010 wb-log {:08X} {}x{} at ({},{}) bpp={} endian={} frame={} avg:{}", p.dest_base, p.w, p.h,
+                    p.x, p.y, p.bpp, p.endian, p.frame, avg);
+      }
+      static const char* dump_wb = std::getenv("WC2010_DUMP_WB");
+      static int dumped_wb = 0;
+      if (dump_wb && p.bpp == 4 && dumped_wb < 400 && std::getenv("WC2010_WB_DIR") &&
+          (std::string(",") + dump_wb + ",").find(fmt::format(",{}x{},", p.w, p.h)) != std::string::npos) {
+        uint32_t row = (uint32_t(p.w) * 3 + 3) & ~3u;
+        for (int pass = 0; pass < 2; ++pass) {
+          std::vector<uint8_t> bmp(54 + size_t(row) * p.h, 0);
+          auto put32 = [&](size_t o, uint32_t v) { std::memcpy(&bmp[o], &v, 4); };
+          bmp[0] = 'B'; bmp[1] = 'M';
+          put32(2, uint32_t(bmp.size())); put32(10, 54); put32(14, 40); put32(18, uint32_t(p.w));
+          put32(22, uint32_t(-p.h)); bmp[26] = 1; bmp[28] = 24;
+          for (int32_t yy = 0; yy < p.h; ++yy)
+            for (int32_t xx = 0; xx < p.w; ++xx) {
+              const uint8_t* s = static_cast<const uint8_t*>(m.pData) + size_t(yy) * m.RowPitch + xx * 4;
+              uint8_t* o = &bmp[54 + size_t(yy) * row + xx * 3];
+              if (pass == 0) { o[0] = s[2]; o[1] = s[1]; o[2] = s[0]; }  // bytes 0,1,2 as R,G,B
+              else o[0] = o[1] = o[2] = s[3];
+            }
+          std::ofstream(fmt::format("{}/wb-{:03}-{:08X}-{}x{}-f{}-{}.bmp", std::getenv("WC2010_WB_DIR"), dumped_wb,
+                                    p.dest_base, p.w, p.h, p.frame, pass ? "a" : "rgb"), std::ios::binary)
+              .write(reinterpret_cast<const char*>(bmp.data()), std::streamsize(bmp.size()));
+        }
+        ++dumped_wb;
+        REXLOG_INFO("wc2010 write-back dump {:08X} {}x{} endian={} frame={}", p.dest_base, p.w, p.h, p.endian, frame_);
+      }
+      StoreTiled(static_cast<const uint8_t*>(m.pData), m.RowPitch, p.dest_base, p.dest_pitch, p.endian, p.bpp, p.x,
+                 p.y, p.w, p.h, p.pack4444);
+#else /* street4 */
+    bool mapped = store && SUCCEEDED(context_->Map(p.staging.get(), 0, D3D11_MAP_READ, 0, &m));
+    double map_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - map_start).count();
+    if (mapped) {
+      // Diagnostics: STREET4_DUMP_WB=<w>x<h>[,...] writes the first stored results of those sizes (host
+      // texel order, color and alpha) as BMPs to STREET4_WB_DIR.
+      // STREET4_WB_LOG=1: per-byte averages of small stored results (A/B comparisons).
+      static const bool wb_log = std::getenv("STREET4_WB_LOG") != nullptr;
+      static int wb_logs = 0;
+      if (wb_log && wb_logs < 600) {
+        ++wb_logs;
+        uint64_t sum[16] = {};
+        uint32_t step = std::max<uint32_t>(1, uint32_t(p.w * p.h) / 4096);
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < uint32_t(p.w * p.h); i += step, ++n) {
+          const uint8_t* s = static_cast<const uint8_t*>(m.pData) + size_t(i / p.w) * m.RowPitch +
+                             size_t(i % p.w) * (p.pack4444 ? 4 : p.bpp);
+          for (uint32_t b = 0; b < std::min<uint32_t>(p.bpp, 16); ++b) sum[b] += s[b];
+        }
+        std::string avg;
+        for (uint32_t b = 0; b < std::min<uint32_t>(p.bpp, 16); ++b) avg += fmt::format(" {}", n ? sum[b] / n : 0);
+        REXLOG_INFO("street4 wb-log {:08X} {}x{} at ({},{}) bpp={} endian={} frame={} avg:{}", p.dest_base, p.w, p.h,
+                    p.x, p.y, p.bpp, p.endian, p.frame, avg);
+      }
+      static const char* dump_wb = std::getenv("STREET4_DUMP_WB");
+      static int dumped_wb = 0;
+      if (dump_wb && p.bpp == 4 && dumped_wb < 400 && std::getenv("STREET4_WB_DIR") &&
+          (std::string(",") + dump_wb + ",").find(fmt::format(",{}x{},", p.w, p.h)) != std::string::npos) {
+        uint32_t row = (uint32_t(p.w) * 3 + 3) & ~3u;
+        for (int pass = 0; pass < 2; ++pass) {
+          std::vector<uint8_t> bmp(54 + size_t(row) * p.h, 0);
+          auto put32 = [&](size_t o, uint32_t v) { std::memcpy(&bmp[o], &v, 4); };
+          bmp[0] = 'B'; bmp[1] = 'M';
+          put32(2, uint32_t(bmp.size())); put32(10, 54); put32(14, 40); put32(18, uint32_t(p.w));
+          put32(22, uint32_t(-p.h)); bmp[26] = 1; bmp[28] = 24;
+          for (int32_t yy = 0; yy < p.h; ++yy)
+            for (int32_t xx = 0; xx < p.w; ++xx) {
+              const uint8_t* s = static_cast<const uint8_t*>(m.pData) + size_t(yy) * m.RowPitch + xx * 4;
+              uint8_t* o = &bmp[54 + size_t(yy) * row + xx * 3];
+              if (pass == 0) { o[0] = s[2]; o[1] = s[1]; o[2] = s[0]; }  // bytes 0,1,2 as R,G,B
+              else o[0] = o[1] = o[2] = s[3];
+            }
+          std::ofstream(fmt::format("{}/wb-{:03}-{:08X}-{}x{}-f{}-{}.bmp", std::getenv("STREET4_WB_DIR"), dumped_wb,
+                                    p.dest_base, p.w, p.h, p.frame, pass ? "a" : "rgb"), std::ios::binary)
+              .write(reinterpret_cast<const char*>(bmp.data()), std::streamsize(bmp.size()));
+        }
+        ++dumped_wb;
+        REXLOG_INFO("street4 write-back dump {:08X} {}x{} endian={} frame={}", p.dest_base, p.w, p.h, p.endian, frame_);
+      }
+      StoreTiled(static_cast<const uint8_t*>(m.pData), m.RowPitch, p.dest_base, p.dest_pitch, p.endian, p.bpp, p.x,
+                 p.y, p.w, p.h, p.pack4444);
+#endif /* PORT_GAME */
+      context_->Unmap(p.staging.get(), 0);
+    }
+    if (RenderProfile::Get().enabled && store) {
+      double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - map_start).count();
+      if (ms > 1)
+#if PORT_GAME == PORT_GAME_COPA2014
+        REXLOG_INFO("copa slow write-back #{} {:.2f} ms: {:08X} {}x{} bpp={} endian={} steady={} age={} all={}",
+                    frame_, ms, p.dest_base, p.w, p.h, p.bpp, p.endian, p.steady, frame_ - p.frame, all);
+#elif PORT_GAME == PORT_GAME_WC2010
+        REXLOG_INFO("wc2010 slow write-back #{} {:.2f} ms (map {:.2f}): {:08X} {}x{} bpp={} endian={} steady={} throttled={} age={} all={}",
+                    frame_, ms, map_ms, p.dest_base, p.w, p.h, p.bpp, p.endian, p.steady, p.throttled, frame_ - p.frame, all);
+#else /* street4 */
+        REXLOG_INFO("street4 slow write-back #{} {:.2f} ms (map {:.2f}): {:08X} {}x{} bpp={} endian={} steady={} throttled={} age={} all={}",
+                    frame_, ms, map_ms, p.dest_base, p.w, p.h, p.bpp, p.endian, p.steady, p.throttled, frame_ - p.frame, all);
+#endif /* PORT_GAME */
+    }
+    if (store) {
+      // Later results for the same destination compare against what was just stored.
+      for (auto& q : writebacks_)
+        if (q.dest_base == p.dest_base) q.snapshot = MemorySnapshot(q.dest_base, q.dest_pitch, q.bpp, q.y, q.h);
+    }
+    if (staging_pool_.size() < 64) staging_pool_.push_back(std::move(p.staging));
+    auto it = writebacks_by_address_.find(p.dest_base);
+    if (it != writebacks_by_address_.end() && --it->second == 0) {
+      writebacks_by_address_.erase(it);
+      // The host copy stays authoritative until the CPU overwrites what was stored now.
+      if (auto r = resolved_.find(p.dest_base); r != resolved_.end()) {
+        uint32_t sample = std::min<uint32_t>(4096, r->second->width * r->second->height);
+        r->second->guest_hash = Hash64(Physical(p.dest_base), sample);
+      }
+    }
+  }
+}
+
+void RendererImpl::DumpTexture(ID3D11Texture2D* texture, const std::string& path) {
+  D3D11_TEXTURE2D_DESC td;
+  texture->GetDesc(&td);
+  const bool half = td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+  if (!half && td.Format != DXGI_FORMAT_R8G8B8A8_UNORM && td.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+    return;
+  td.Usage = D3D11_USAGE_STAGING;
+  td.BindFlags = 0;
+  td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  td.MiscFlags = 0;
+  td.MipLevels = 1;
+  td.ArraySize = 1;
+  Com<ID3D11Texture2D> staging;
+  if (FAILED(device_->CreateTexture2D(&td, nullptr, staging.put()))) return;
+  context_->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, texture, 0, nullptr);
+  D3D11_MAPPED_SUBRESOURCE m;
+  if (FAILED(context_->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m))) return;
+  auto h2f = [](uint16_t h) {
+    uint32_t sgn = (h & 0x8000u) << 16, e = (h >> 10) & 31, mant = h & 0x3FF;
+    uint32_t f = e == 0 ? sgn : e == 31 ? (sgn | 0x7F800000 | (mant << 13)) : (sgn | ((e + 112) << 23) | (mant << 13));
+    return AsFloat(f);
+  };
+  std::ofstream f(path, std::ios::binary);
+  uint32_t w = td.Width, h = td.Height, row = (w * 3 + 3) & ~3u, size = 54 + row * h;
+  uint8_t hdr[54] = {'B', 'M'};
+  std::memcpy(hdr + 2, &size, 4);
+  uint32_t off = 54, dib = 40, planes_bpp = 1 | (24 << 16);
+  std::memcpy(hdr + 10, &off, 4);
+  std::memcpy(hdr + 14, &dib, 4);
+  std::memcpy(hdr + 18, &w, 4);
+  std::memcpy(hdr + 22, &h, 4);
+  std::memcpy(hdr + 26, &planes_bpp, 4);
+  f.write(reinterpret_cast<char*>(hdr), 54);
+  std::vector<uint8_t> line(row);
+  float lo[4] = {1e30f, 1e30f, 1e30f, 1e30f}, hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+  for (uint32_t y = 0; y < h; ++y) {
+    const uint8_t* p = static_cast<const uint8_t*>(m.pData) + (h - 1 - y) * m.RowPitch;
+    for (uint32_t x = 0; x < w; ++x) {
+      for (int c = 0; c < 4; ++c) {
+        float v;
+        if (half) {
+          uint16_t hv;
+          std::memcpy(&hv, p + x * 8 + c * 2, 2);
+          v = h2f(hv);
+        } else {
+          v = p[x * 4 + c] / 255.0f;
+        }
+        lo[c] = std::min(lo[c], v);
+        hi[c] = std::max(hi[c], v);
+      }
+      for (int c = 0; c < 3; ++c) {
+        float v;
+        if (half) {
+          uint16_t hv;
+          std::memcpy(&hv, p + x * 8 + c * 2, 2);
+          v = h2f(hv);
+        } else {
+          v = p[x * 4 + c] / 255.0f;
+        }
+        line[x * 3 + (2 - c)] = uint8_t(std::clamp(v, 0.0f, 1.0f) * 255.0f);
+      }
+    }
+    f.write(reinterpret_cast<char*>(line.data()), row);
+  }
+  context_->Unmap(staging.get(), 0);
+  REXLOG_INFO("trace dump {} {}x{}: r=[{:g},{:g}] g=[{:g},{:g}] b=[{:g},{:g}] a=[{:g},{:g}]", path, w, h, lo[0], hi[0],
+              lo[1], hi[1], lo[2], hi[2], lo[3], hi[3]);
+}
+
+// Diagnostics: first 4 bytes of one texel.
+uint32_t RendererImpl::ReadPixel(ID3D11Texture2D* texture, uint32_t x, uint32_t y) {
+  D3D11_TEXTURE2D_DESC td;
+  texture->GetDesc(&td);
+  if (x >= td.Width || y >= td.Height) return 0;
+  D3D11_TEXTURE2D_DESC sd{1, 1, 1, 1, td.Format, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+  Com<ID3D11Texture2D> staging;
+  if (FAILED(device_->CreateTexture2D(&sd, nullptr, staging.put()))) return 0;
+  D3D11_BOX box{x, y, 0, x + 1, y + 1, 1};
+  context_->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, texture, 0, &box);
+  D3D11_MAPPED_SUBRESOURCE m;
+  uint32_t v = 0;
+  if (SUCCEEDED(context_->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m))) {
+    std::memcpy(&v, m.pData, 4);
+    context_->Unmap(staging.get(), 0);
+  }
+  return v;
+}
+
+// --------------------------------------------------------------------------- resolve
+void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
+  RenderPhase profile(RenderProfile::Resolve);
+  if (!EnsureDevice()) return;
+  uint32_t copy_control = dev.reg(0x2318);
+  // Source: D3DRESOLVE_RENDERTARGET0-3 / DEPTHSTENCIL (4) in the low bits of the flags; the
+  // copy control register is not kept in the device's shadow (it reads 0).
+  uint32_t src_select = (req.flags & 7) <= 4 ? (req.flags & 7) : (copy_control & 7);
+  bool clear_color = (copy_control >> 8) & 1 || (req.flags & 0x100);
+  bool clear_depth = (copy_control >> 9) & 1 || (req.flags & 0x200);
+  uint32_t copy_command = (copy_control >> 20) & 3;
+  uint32_t surface = dev.reg(0x2000);
+  uint32_t pitch = std::max<uint32_t>(surface & 0x3FFF, 1);
+  uint32_t window_br = dev.reg(0x2082);
+  uint32_t height = std::max<uint32_t>((window_br >> 16) & 0x3FFF, 1);
+  if (tiling_) {
+    pitch = tiling_width_;
+    height = tiling_height_;
+  }
+
+  RenderTarget* src = nullptr;
+  if (src_select == 4) {
+    uint32_t info = dev.reg(0x2002);
+#if PORT_GAME == PORT_GAME_COPA2014
+    src = GetRenderTarget(true, info & 0xFFF, (info >> 16) & 1, pitch, height);
+#else /* street4 wc2010 */
+    src = GetRenderTarget(dev, true, info & 0xFFF, (info >> 16) & 1, pitch, height);
+#endif /* PORT_GAME */
+  } else {
+    const uint32_t regs[4] = {0x2001, 0x2003, 0x2004, 0x2005};
+    uint32_t info = dev.reg(regs[src_select & 3]);
+#if PORT_GAME == PORT_GAME_COPA2014
+    src = GetRenderTarget(false, info & 0xFFF, (info >> 16) & 0xF, pitch, height);
+#else /* street4 wc2010 */
+    src = GetRenderTarget(dev, false, info & 0xFFF, (info >> 16) & 0xF, pitch, height);
+#endif /* PORT_GAME */
+  }
+  if (!src) return;
+#if PORT_GAME == PORT_GAME_COPA2014
+  if (TraceFrame(frame_))
+    REXLOG_INFO("trace resolve flags={:X} copyctl={:08X} has_dest={} rect=({},{})-({},{}) surface={:08X} c0={:08X} z={:08X}",
+#else /* street4 wc2010 */
+  const bool surface_trace = !tiling_ && TraceSurface(window_br & 0x3FFF, height);
+  if (TraceFrame(frame_) || surface_trace)
+    REXLOG_INFO("trace resolve flags={:X} copyctl={:08X} has_dest={} rect=({},{})-({},{}) surface={:08X} c0={:08X} z={:08X}"
+                " src_select={} clear_color={} clear_depth={} color_clear_reg={:08X} dest={:08X} frame={}",
+#endif /* PORT_GAME */
+                req.flags, copy_control, req.has_dest, req.src_x0, req.src_y0, req.src_x1, req.src_y1,
+#if PORT_GAME == PORT_GAME_COPA2014
+                surface, dev.reg(0x2001), dev.reg(0x2002));
+#elif PORT_GAME == PORT_GAME_WC2010
+                surface, dev.reg(0x2001), dev.reg(0x2002), src_select, clear_color, clear_depth, dev.reg(0x231E),
+                dev.reg(0x2319), frame_);
+  if (surface_trace && !src->depth) {
+    // The source as it is resolved (before any clear), to follow generated maps pass by pass.
+    static const char* dump_dir = std::getenv("WC2010_SHOT_DIR");
+    static int surface_dumps = 0;
+    if (dump_dir && surface_dumps < 200)
+      DumpTexture(src->texture.get(), fmt::format("{}/surface-{:03}-f{}-to-{:08X}.bmp", dump_dir, surface_dumps++,
+                                                  frame_, dev.reg(0x2319)));
+  }
+#else /* street4 */
+                surface, dev.reg(0x2001), dev.reg(0x2002), src_select, clear_color, clear_depth, dev.reg(0x231E),
+                dev.reg(0x2319), frame_);
+  if (surface_trace && !src->depth) {
+    // The source as it is resolved (before any clear), to follow generated maps pass by pass.
+    static const char* dump_dir = std::getenv("STREET4_SHOT_DIR");
+    static int surface_dumps = 0;
+    if (dump_dir && surface_dumps < 200)
+      DumpTexture(src->texture.get(), fmt::format("{}/surface-{:03}-f{}-to-{:08X}.bmp", dump_dir, surface_dumps++,
+                                                  frame_, dev.reg(0x2319)));
+  }
+#endif /* PORT_GAME */
+  int32_t x0 = req.src_x0, y0 = req.src_y0, x1 = req.src_x1, y1 = req.src_y1;
+  if (x1 < 0) { x0 = 0; y0 = 0; x1 = int32_t(src->width); y1 = int32_t(height); }
+  x1 = std::min<int32_t>(x1, int32_t(src->width));
+  y1 = std::min<int32_t>(y1, int32_t(src->height));
+  const int32_t dst_x = req.has_dest_point ? req.dst_x : x0;
+  const int32_t dst_y = req.has_dest_point ? req.dst_y : y0;
+
+  if (copy_command != 3 && req.has_dest && x1 > x0 && y1 > y0) {
+    uint32_t dest_base = dev.reg(0x2319);
+    uint32_t dest_pitch_reg = dev.reg(0x231A);
+    uint32_t dest_info = dev.reg(0x231B);
+    uint32_t dest_pitch = std::max<uint32_t>(dest_pitch_reg & 0x3FFF, 1);
+    uint32_t dest_height = std::max<uint32_t>((dest_pitch_reg >> 16) & 0x3FFF, 1);
+    uint32_t dest_format = req.dest_format >= 0 ? uint32_t(req.dest_format) : (dest_info >> 7) & 0x3F;
+    if (src->depth) dest_format = 36;  // depth -> 32-bit float texture
+    static std::set<uint64_t> seen_resolves;
+    if (frame_ < 5 || TraceFrame(frame_) ||
+        seen_resolves.insert((uint64_t(dest_base) << 32) | (dest_pitch << 16) ^ (dest_height << 6) ^ dest_format).second)
+#if PORT_GAME == PORT_GAME_COPA2014
+      REXLOG_INFO("copa resolve: src rt base={} fmt={} depth={} rect=({},{})-({},{}) -> dest "
+#elif PORT_GAME == PORT_GAME_WC2010
+      REXLOG_INFO("wc2010 resolve: src rt base={} fmt={} depth={} rect=({},{})-({},{}) -> dest "
+#else /* street4 */
+      REXLOG_INFO("street4 resolve: src rt base={} fmt={} depth={} rect=({},{})-({},{}) -> dest "
+#endif /* PORT_GAME */
+                  "{:08X} pitch={} h={} fmt={} at ({},{}) dest_info={:08X} endian={} rb_swap={}",
+                  src->edram_base, src->format, src->depth, x0, y0, x1, y1, dest_base, dest_pitch,
+                  dest_height, dest_format, dst_x, dst_y, dest_info, req.dest_endian,
+                  req.dest_red_blue_swap);
+#if PORT_GAME == PORT_GAME_COPA2014
+#else /* street4 wc2010 */
+    if (TraceSurface(uint32_t(x1 - x0), uint32_t(y1 - y0)))
+      REXLOG_INFO("trace resolve rect-match: window={}x{} surface pitch={} src {}x{} scale={:g} -> dest {:08X} fmt={} frame={}",
+                  window_br & 0x3FFF, height, pitch, src->width, src->height, src->scale, dest_base, dest_format,
+                  frame_);
+#endif /* PORT_GAME */
+    if (auto* dst = GetResolved(dest_base & 0x1FFFFFFF, dest_pitch, dest_height, dest_format, true)) {
+      D3D11_RECT hr = ScaledRect(dst_x, dst_y, dst_x + (x1 - x0), dst_y + (y1 - y0), dst->scale);
+      D3D11_VIEWPORT vp{float(hr.left), float(hr.top), float(hr.right - hr.left), float(hr.bottom - hr.top), 0, 1};
+      float sw = float(src->width), sh = float(src->height);
+      // The GPU stores 8_8_8_8 resolves as BGRA; games sample them with a fetch swizzle that
+      // swaps red and blue back (60A), so the host copy keeps that order (as in BF2 / Street 3).
+#if PORT_GAME == PORT_GAME_COPA2014
+      // 4_4_4_4 destinations (the crowd sprite atlas) are swapped the same way.
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+      bool swap = !src->depth && src->format <= 1 && (dest_format == 6 || dest_format == 62 || dest_format == 15) &&
+                  req.dest_red_blue_swap != 0;
+      dst->bgra = swap;
+#if PORT_GAME == PORT_GAME_COPA2014
+      // The post effects draw 128x128 targets inside the 4K surface. Averaging just that rectangle
+      // replaces a resolve of the whole surface per target.
+      static const bool no_rect_resolve = std::getenv("COPA_NO_RECT_RESOLVE") != nullptr;  // A/B
+      D3D11_RECT part{};
+      const bool small_rect = src->samples > 1 && !src->depth && !no_rect_resolve &&
+                         uint64_t(x1 - x0) * uint64_t(y1 - y0) * 4 <= uint64_t(src->width) * uint64_t(src->height);
+      if (small_rect) {
+        // One texel more on each side: the blit below filters.
+        part = ScaledRect(std::max(x0 - 1, 0), std::max(y0 - 1, 0), std::min<int32_t>(x1 + 1, src->width),
+                          std::min<int32_t>(y1 + 1, src->height), src->scale);
+      }
+      BlitTo(dst->rtv.get(), dst->width, dst->height, vp, SingleSampleSrv(*src, small_rect ? &part : nullptr), sw, sh,
+             x0 / sw, y0 / sh, x1 / sw, y1 / sh, src->depth, swap);
+      static const bool writeback = std::getenv("COPA_NO_RESOLVE_WRITEBACK") == nullptr;
+#elif PORT_GAME == PORT_GAME_WC2010
+      BlitTo(dst->rtv.get(), dst->width, dst->height, vp, SingleSampleSrv(*src), sw, sh, x0 / sw, y0 / sh,
+             x1 / sw, y1 / sh, src->depth, swap);
+      static const bool writeback = std::getenv("WC2010_NO_RESOLVE_WRITEBACK") == nullptr;
+#else /* street4 */
+      BlitTo(dst->rtv.get(), dst->width, dst->height, vp, SingleSampleSrv(*src), sw, sh, x0 / sw, y0 / sh,
+             x1 / sw, y1 / sh, src->depth, swap);
+      static const bool writeback = std::getenv("STREET4_NO_RESOLVE_WRITEBACK") == nullptr;
+#endif /* PORT_GAME */
+      if (writeback)
+        QueueWriteBack(*dst, dest_base, dest_pitch,
+                       req.dest_endian >= 0 ? uint32_t(req.dest_endian) : dest_info & 7, dst_x, dst_y,
+                       x1 - x0, y1 - y0, dev.u32(dev::kTimestamp));
+      // Remember what the CPU-visible memory looked like, to detect CPU overwrites.
+      uint32_t sample = std::min<uint32_t>(4096, dest_pitch * dest_height);
+      dst->guest_hash = Hash64(Physical(dest_base), sample);
+      dst->frame = frame_;
+      if (TraceFrame(frame_) && !src->depth)
+        REXLOG_INFO("trace resolve pixels swap={} src L={:08X} R={:08X} dst L={:08X} R={:08X} ({}x{})", swap,
+                    src->samples > 1 ? 0u : ReadPixel(src->texture.get(), src->width / 4, src->height / 2),
+                    src->samples > 1 ? 0u : ReadPixel(src->texture.get(), src->width * 3 / 4, src->height / 2),
+                    ReadPixel(dst->texture.get(), dst->width / 4, dst->height / 2),
+                    ReadPixel(dst->texture.get(), dst->width * 3 / 4, dst->height / 2), dst->width,
+                    dst->height);
+#if PORT_GAME == PORT_GAME_COPA2014
+      if (glitch_log_enabled_) {
+        // Copies of chosen resolve results of this frame (the last one per destination).
+        static const uint32_t kSnapDests[] = {0x1C8EB000, 0x1E13D000, 0x1B69A000, 0x1DDA5000};
+        for (int d = 0; d < 4; ++d) {
+          if ((dest_base & 0x1FFFFFFF) != kSnapDests[d]) continue;
+          auto& t = snap_[mask_snap_cur_][d];
+          if (!t.tex) {
+            D3D11_TEXTURE2D_DESC sd{dst->width, dst->height, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
+                                    D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+            device_->CreateTexture2D(&sd, nullptr, t.tex.put());
+            if (t.tex) device_->CreateRenderTargetView(t.tex.get(), nullptr, t.rtv.put());
+          }
+          if (t.rtv) {
+            D3D11_VIEWPORT svp{0, 0, float(dst->width), float(dst->height), 0, 1};
+            BlitTo(t.rtv.get(), dst->width, dst->height, svp, dst->srv.get(), float(dst->width), float(dst->height), 0,
+                   0, 1, 1, false, false);
+            t.valid = true;
+          }
+        }
+      }
+      static const char* dump_dir = std::getenv("COPA_SHOT_DIR");
+#elif PORT_GAME == PORT_GAME_WC2010
+      static const char* dump_dir = std::getenv("WC2010_SHOT_DIR");
+#else /* street4 */
+      static const char* dump_dir = std::getenv("STREET4_SHOT_DIR");
+#endif /* PORT_GAME */
+      static int dumps = 0;
+#if PORT_GAME == PORT_GAME_COPA2014
+      static const uint32_t dump_only = std::getenv("COPA_DUMP_RESOLVE")  // diagnostics: one destination
+                                            ? uint32_t(std::strtoul(std::getenv("COPA_DUMP_RESOLVE"), nullptr, 16))
+                                            : 0;
+      if (dump_dir && TraceFrame(frame_) && dumps < 64 && (!dump_only || dump_only == dest_base))
+#else /* street4 wc2010 */
+      if (dump_dir && TraceFrame(frame_) && dumps < 64)
+#endif /* PORT_GAME */
+        DumpTexture(dst->texture.get(), fmt::format("{}/resolve-{:02}-{:08X}-from-{:X}.bmp", dump_dir, dumps++,
+                                                     dest_base, src->edram_base));
+    }
+  }
+  if (clear_color && !src->depth && context1_) {
+    uint32_t c = dev.reg(0x231E), lo = dev.reg(0x231F);
+    float rgba[4];
+    switch (src->format) {
+      case 0: case 1:
+        for (int i = 0; i < 4; ++i) rgba[i] = float((c >> (8 * i)) & 0xFF) / 255.0f;
+        break;
+      case 2: case 10:
+        rgba[0] = float(c & 0x3FF) / 1023.0f;
+        rgba[1] = float((c >> 10) & 0x3FF) / 1023.0f;
+        rgba[2] = float((c >> 20) & 0x3FF) / 1023.0f;
+        rgba[3] = float(c >> 30) / 3.0f;
+        break;
+      case 14:
+        rgba[0] = AsFloat(c); rgba[1] = rgba[2] = rgba[3] = 0;
+        break;
+      default: {
+        // 64-bit formats: high dword holds the first two halves.
+        auto h2f = [](uint32_t h) {
+          uint32_t s = (h & 0x8000) << 16, e = (h >> 10) & 31, m = h & 0x3FF;
+          uint32_t f = e == 0 ? s : e == 31 ? (s | 0x7F800000 | (m << 13))
+                                            : (s | ((e + 112) << 23) | (m << 13));
+          return AsFloat(f);
+        };
+        rgba[0] = h2f(c >> 16); rgba[1] = h2f(c & 0xFFFF);
+        rgba[2] = h2f(lo >> 16); rgba[3] = h2f(lo & 0xFFFF);
+      }
+    }
+    D3D11_RECT r = ScaledRect(x0, y0, x1, y1, src->scale);
+    context1_->ClearView(src->rtv.get(), rgba, &r, 1);
+    src->single_stale = true;
+  }
+  if (clear_depth) {
+    uint32_t info = dev.reg(0x2002);
+#if PORT_GAME == PORT_GAME_COPA2014
+    if (auto* d = GetRenderTarget(true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
+#else /* street4 wc2010 */
+    if (auto* d = GetRenderTarget(dev, true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
+#endif /* PORT_GAME */
+      uint32_t dv = dev.reg(0x231D);
+      float z = d->format == 1 ? 0.0f : float(dv >> 8) / 16777215.0f;
+      if (d->format == 1) {
+        uint32_t f24 = dv >> 8, m = f24 & 0xFFFFF, e = f24 >> 20;
+        z = e ? (1.0f + m / 1048576.0f) * std::ldexp(1.0f, int(e) - 15) : m / 1048576.0f * std::ldexp(1.0f, -14);
+      }
+      z = std::clamp(z, 0.0f, 1.0f);
+      uint64_t area = uint64_t(std::max(x1 - x0, 0)) * uint64_t(std::max(y1 - y0, 0));
+#if PORT_GAME == PORT_GAME_COPA2014
+      static const bool no_tile_clear = std::getenv("COPA_NO_TILE_DEPTH_CLEAR") != nullptr;  // diagnostics
+#elif PORT_GAME == PORT_GAME_WC2010
+      static const bool no_tile_clear = std::getenv("WC2010_NO_TILE_DEPTH_CLEAR") != nullptr;  // A/B
+#else /* street4 */
+      static const bool no_tile_clear = std::getenv("STREET4_NO_TILE_DEPTH_CLEAR") != nullptr;  // A/B
+#endif /* PORT_GAME */
+      if (tiling_ && !no_tile_clear && area < uint64_t(pitch) * height) {
+        if (tile_depth_clear_.dsv.get() != d->dsv.get()) FlushTileDepthClear();
+        if (!tile_depth_clear_.dsv) {
+          d->dsv->AddRef();
+          *tile_depth_clear_.dsv.put() = d->dsv.get();
+        }
+        tile_depth_clear_.z = z;
+        tile_depth_clear_.stencil = UINT8(dv & 0xFF);
+        tile_depth_clear_.area += area;
+        if (tile_depth_clear_.area >= uint64_t(pitch) * height) FlushTileDepthClear();
+      } else {
+        d->single_stale = true;
+        context_->ClearDepthStencilView(d->dsv.get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, z, UINT8(dv & 0xFF));
+      }
+    }
+  }
+}
+
+void RendererImpl::ClearBound(const GuestDevice& dev, uint32_t color_targets,
+                              const float rgba[4], bool depth, float z, bool stencil, uint8_t s,
+                              const int32_t* rects, uint32_t rect_count) {
+  if (!EnsureDevice()) return;
+  uint32_t surface = dev.reg(0x2000);
+  uint32_t pitch = std::max<uint32_t>(surface & 0x3FFF, 1);
+  uint32_t height = std::max<uint32_t>((dev.reg(0x2082) >> 16) & 0x3FFF, 1);
+  if (tiling_) {
+    pitch = tiling_width_;
+    height = tiling_height_;
+  }
+#if PORT_GAME == PORT_GAME_COPA2014
+  if (TraceFrame(frame_))
+#else /* street4 wc2010 */
+  if (TraceFrame(frame_) || (!tiling_ && TraceSurface(dev.reg(0x2082) & 0x3FFF, height)))
+#endif /* PORT_GAME */
+    REXLOG_INFO("trace clear z={:g} targets={:X} depth={} stencil={} rects={} c0={:08X} z={:08X} pitch={} h={} rgba=({:g},{:g},{:g},{:g})",
+                z, color_targets, depth, stencil, rect_count, dev.reg(0x2001), dev.reg(0x2002), pitch, height,
+                rgba[0], rgba[1], rgba[2], rgba[3]);
+  std::vector<D3D11_RECT> r;
+  const uint32_t regs[4] = {0x2001, 0x2003, 0x2004, 0x2005};
+  for (int i = 0; i < 4; ++i) {
+    if (!(color_targets & (1u << i))) continue;
+    uint32_t info = dev.reg(regs[i]);
+#if PORT_GAME == PORT_GAME_COPA2014
+    auto* rt = GetRenderTarget(false, info & 0xFFF, (info >> 16) & 0xF, pitch, height);
+#else /* street4 wc2010 */
+    auto* rt = GetRenderTarget(dev, false, info & 0xFFF, (info >> 16) & 0xF, pitch, height);
+#endif /* PORT_GAME */
+    if (!rt) continue;
+    r.clear();
+    for (uint32_t k = 0; k < rect_count; ++k)
+      r.push_back(ScaledRect(rects[k * 4], rects[k * 4 + 1], rects[k * 4 + 2], rects[k * 4 + 3], rt->scale));
+    rt->single_stale = true;
+    if (!r.empty() && context1_)
+      context1_->ClearView(rt->rtv.get(), rgba, r.data(), UINT(r.size()));
+    else
+      context_->ClearRenderTargetView(rt->rtv.get(), rgba);
+  }
+  if (depth || stencil) {
+    uint32_t info = dev.reg(0x2002);
+#if PORT_GAME == PORT_GAME_COPA2014
+    if (auto* d = GetRenderTarget(true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
+#else /* street4 wc2010 */
+    if (auto* d = GetRenderTarget(dev, true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
+#endif /* PORT_GAME */
+      // Depth-stencil views cannot be cleared per rectangle in D3D11; rectangles that
+      // cover less than the surface are rare for depth and cleared fully.
+      d->single_stale = true;
+      context_->ClearDepthStencilView(
+          d->dsv.get(), (depth ? D3D11_CLEAR_DEPTH : 0) | (stencil ? D3D11_CLEAR_STENCIL : 0),
+          std::clamp(z, 0.0f, 1.0f), s);
+    }
+  }
+}
+
+// --------------------------------------------------------------------------- present
+void RendererImpl::Present(const uint8_t* fetch) {
+  natives::FrameTick();
+  RenderPhase profile(RenderProfile::Present);
+  auto enter = std::chrono::steady_clock::now();
+  if (!EnsureDevice()) return;
+  struct SlowLog {
+    std::chrono::steady_clock::time_point t;
+    uint64_t frame;
+    ~SlowLog() {
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
+      static int logs = 0;
+#if PORT_GAME == PORT_GAME_COPA2014
+      if (ms > 100 && logs++ < 20) REXLOG_WARN("copa present #{}: Renderer::Present took {} ms", frame, ms);
+#elif PORT_GAME == PORT_GAME_WC2010
+      if (ms > 100 && logs++ < 20) REXLOG_WARN("wc2010 present #{}: Renderer::Present took {} ms", frame, ms);
+#else /* street4 */
+      if (ms > 100 && logs++ < 20) REXLOG_WARN("street4 present #{}: Renderer::Present took {} ms", frame, ms);
+#endif /* PORT_GAME */
+    }
+  } slow_log{enter, frame_};
+  uint32_t f[6];
+  for (int k = 0; k < 6; ++k) f[k] = LoadBE32(fetch + k * 4);
+  TextureDesc desc = TextureDescFromFetch(f);
+  ID3D11ShaderResourceView* src = nullptr;
+  bool src_bgra = false;
+  float sw = float(desc.width), sh = float(desc.height);
+  // The front buffer header holds a CPU virtual address (full 20-bit page field); the
+  // resolve wrote to its GPU physical address.
+  uint32_t front_virtual = (f[1] >> 12) << 12;
+  if (auto* r = GetResolved(VirtualToPhysical(front_virtual) & 0x1FFFFFFF, 0, 0, 0, false)) {
+    src = r->srv.get();
+    src_bgra = r->bgra;
+    sw = float(r->width);
+    sh = float(r->height);
+  } else if (auto* r2 = GetResolved(desc.base_address & 0x1FFFFFFF, 0, 0, 0, false)) {
+    src = r2->srv.get();
+    src_bgra = r2->bgra;
+    sw = float(r2->width);
+    sh = float(r2->height);
+  }
+  if (frame_ < 5 || (frame_ % 600) == 0 || TraceFrame(frame_))
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_INFO("copa present #{}: front base={:08X} {}x{} fmt={} found={}", frame_,
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_INFO("wc2010 present #{}: front base={:08X} {}x{} fmt={} found={}", frame_,
+#else /* street4 */
+    REXLOG_INFO("street4 present #{}: front base={:08X} {}x{} fmt={} found={}", frame_,
+#endif /* PORT_GAME */
+                desc.base_address, desc.width, desc.height, desc.format, src != nullptr);
+#if PORT_GAME == PORT_GAME_COPA2014
+  static const char* shot_dir = std::getenv("COPA_SHOT_DIR");
+  static const int shot_every = std::getenv("COPA_SHOT_EVERY") ? std::atoi(std::getenv("COPA_SHOT_EVERY")) : 0;
+#elif PORT_GAME == PORT_GAME_WC2010
+  static const char* shot_dir = std::getenv("WC2010_SHOT_DIR");
+  static const int shot_every = std::getenv("WC2010_SHOT_EVERY") ? std::atoi(std::getenv("WC2010_SHOT_EVERY")) : 0;
+#else /* street4 */
+  static const char* shot_dir = std::getenv("STREET4_SHOT_DIR");
+  static const int shot_every = std::getenv("STREET4_SHOT_EVERY") ? std::atoi(std::getenv("STREET4_SHOT_EVERY")) : 0;
+#endif /* PORT_GAME */
+  bool take_shot = src && shot_dir && shot_every > 0 && frame_ > 0 && (frame_ % shot_every) == 0;
+#if PORT_GAME == PORT_GAME_COPA2014
+  // Diagnostics: COPA_GLITCH_DETECT=<percent>[:<first frame>] looks for transient glitches (seen
+  // in matches for a few frames): a frame where at least <percent>% of the samples change at once
+  // is saved and the next frame traced; when the picture returns to the frame before within 24
+  // frames, it is logged as a glitch ("copa glitch-detect GLITCH"), otherwise (a camera cut) its
+  // picture is deleted.
+  static const int glitch_percent = std::getenv("COPA_GLITCH_DETECT") ? std::atoi(std::getenv("COPA_GLITCH_DETECT")) : 0;
+  static const uint64_t glitch_first = [] {
+    const char* e = std::getenv("COPA_GLITCH_DETECT");
+    const char* c = e ? std::strchr(e, ':') : nullptr;
+    return c ? std::strtoull(c + 1, nullptr, 10) : 0ull;
+  }();
+  static std::vector<uint8_t> glitch_prev, glitch_base;
+  static uint64_t glitch_cand = 0;
+  static uint32_t glitch_cand_percent = 0;
+  static int glitch_events = 0;
+  // Diagnostics only: reading the front buffer back stalls the GPU (a hitch every 120 frames),
+  // so the periodic average needs COPA_FRONT_AVG=1.
+  static const bool front_avg = std::getenv("COPA_FRONT_AVG") != nullptr;
+  if (src && ((front_avg && (frame_ % 120) == 0) || take_shot || glitch_percent > 0)) {
+#elif PORT_GAME == PORT_GAME_WC2010
+  // Diagnostics only: reading the front buffer back stalls the GPU (it caused a ~20 ms hitch
+  // every 120 frames), so the periodic average needs WC2010_FRONT_AVG=1.
+  static const bool front_avg = std::getenv("WC2010_FRONT_AVG") != nullptr;
+  if (src && ((front_avg && (frame_ % 120) == 0) || take_shot)) {
+#else /* street4 */
+  // Diagnostics only: reading the front buffer back stalls the GPU (it caused a ~20 ms hitch
+  // every 120 frames), so the periodic average needs STREET4_FRONT_AVG=1.
+  static const bool front_avg = std::getenv("STREET4_FRONT_AVG") != nullptr;
+  if (src && ((front_avg && (frame_ % 120) == 0) || take_shot)) {
+#endif /* PORT_GAME */
+    // Diagnostics: average color of the guest front buffer.
+    Com<ID3D11Resource> res;
+    src->GetResource(res.put());
+    D3D11_TEXTURE2D_DESC td;
+    static_cast<ID3D11Texture2D*>(res.get())->GetDesc(&td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    Com<ID3D11Texture2D> staging;
+    if (td.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+        SUCCEEDED(device_->CreateTexture2D(&td, nullptr, staging.put()))) {
+      context_->CopyResource(staging.get(), res.get());
+      D3D11_MAPPED_SUBRESOURCE m;
+      if (SUCCEEDED(context_->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m))) {
+        uint64_t sum[4] = {};
+        uint32_t n = 0;
+#if PORT_GAME == PORT_GAME_COPA2014
+        std::vector<uint8_t> grid;
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+        for (uint32_t y = 0; y < td.Height; y += 16)
+          for (uint32_t x = 0; x < td.Width; x += 16, ++n) {
+            const uint8_t* p = static_cast<const uint8_t*>(m.pData) + y * m.RowPitch + x * 4;
+            for (int c = 0; c < 4; ++c) sum[c] += p[src_bgra && c != 1 && c != 3 ? 2 - c : c];
+#if PORT_GAME == PORT_GAME_COPA2014
+            if (glitch_percent > 0) grid.insert(grid.end(), p, p + 3);
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+          }
+#if PORT_GAME == PORT_GAME_COPA2014
+        std::string glitch_name;
+        if (glitch_percent > 0 && n && shot_dir) {
+          // Percentage of samples whose color changed noticeably.
+          auto changed = [n](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+            if (a.size() != b.size()) return 0u;
+            uint32_t k = 0;
+            for (size_t i = 0; i < a.size(); i += 3) {
+              int d = 0;
+              for (int c = 0; c < 3; ++c) d = std::max(d, std::abs(int(a[i + c]) - int(b[i + c])));
+              k += d > 48;
+            }
+            return k * 100 / n;
+          };
+          auto cand_name = [&](uint64_t f) { return fmt::format("{}/glitch-{:06}.bmp", shot_dir, f); };
+          if (glitch_cand) {
+            uint32_t back = changed(grid, glitch_base);
+            if (back <= std::max(10u, glitch_cand_percent / 3)) {
+              REXLOG_INFO("copa glitch-detect GLITCH frames {}-{} ({}% changed, {}% from the frame before at the end)",
+                          glitch_cand, frame_ - 1, glitch_cand_percent, back);
+              glitch_cand = 0;
+            } else if (frame_ - glitch_cand > 24) {
+              std::error_code ec;
+              std::filesystem::remove(cand_name(glitch_cand), ec);
+              glitch_cand = 0;
+            }
+          } else if (!glitch_prev.empty() && frame_ >= glitch_first && glitch_events < 200) {
+            uint32_t jump = changed(grid, glitch_prev);
+            if (jump >= uint32_t(glitch_percent)) {
+              ++glitch_events;
+              glitch_cand = frame_;
+              glitch_cand_percent = jump;
+              glitch_base = glitch_prev;
+              glitch_name = cand_name(frame_);
+              REXLOG_INFO("copa glitch-detect candidate frame {}: {}% changed", frame_, jump);
+              for (int k = 0; k < 2; ++k)
+                for (int d = 0; d < 4; ++d)
+                  if (glitch_events <= 6 && snap_[k][d].valid)
+                    DumpTexture(snap_[k][d].tex.get(), fmt::format("{}/glitch-{:06}-snap{}-{}.bmp", shot_dir, frame_, d,
+                                                                   k == mask_snap_cur_ ? "at" : "before"));
+              for (int k = 0; k < 2 && glitch_events <= 3; ++k)
+                for (auto& [slot, srv] : pitch_srvs_[k])
+                  DumpSrv(srv.get(), fmt::format("{}/glitch-{:06}-pitch-t{}-{}.bmp", shot_dir, frame_, slot,
+                                                 k == mask_snap_cur_ ? "at" : "before"));
+              if (glitch_events <= 6) {
+                // VS constant registers that differ: earlier pair (two normal frames), then normal vs glitch.
+                auto diff = [&](uint64_t fa, uint64_t fb) {
+                  auto& a = pitch_vsc_[fa % 3];
+                  auto& b = pitch_vsc_[fb % 3];
+                  if (pitch_vsc_frame_[fa % 3] != fa || pitch_vsc_frame_[fb % 3] != fb) return;
+                  std::string m;
+                  int n = 0;
+                  for (int r = 0; r < 256; ++r)
+                    if (std::memcmp(&a[r * 4], &b[r * 4], 16) && n++ < 40)
+                      m += fmt::format(" c{}=({:g},{:g},{:g},{:g})->({:g},{:g},{:g},{:g})", r, AsFloat(a[r * 4]),
+                                       AsFloat(a[r * 4 + 1]), AsFloat(a[r * 4 + 2]), AsFloat(a[r * 4 + 3]),
+                                       AsFloat(b[r * 4]), AsFloat(b[r * 4 + 1]), AsFloat(b[r * 4 + 2]),
+                                       AsFloat(b[r * 4 + 3]));
+                  REXLOG_INFO("copa glitch vsc {}->{}: {} registers differ:{}", fa, fb, n, m);
+                };
+                diff(frame_ - 2, frame_ - 1);
+                diff(frame_ - 1, frame_);
+              }
+              for (int k = 0; k < 2 && glitch_events <= 6; ++k) {
+                const char* when = k == mask_snap_cur_ ? "at" : "before";
+                REXLOG_INFO("copa glitch pitch draws {}: {}", when, pitch_draws_[k]);
+                for (int phase = 0; phase < 2; ++phase) {
+                  auto& c = pitch_cap_[k][phase];
+                  if (!c.valid) continue;
+                  const char* ph = phase ? "post" : "pre";
+                  if (c.color_srv)
+                    DumpSrv(c.color_srv.get(), fmt::format("{}/glitch-{:06}-pitch-rt-{}-{}.bmp", shot_dir, frame_, ph, when));
+                  if (phase == 0)
+                    for (int slot = 0; slot < 32; ++slot)
+                      if (pitch_srv_cap_[k][slot].valid)
+                        DumpSrv(pitch_srv_cap_[k][slot].srv.get(),
+                                fmt::format("{}/glitch-{:06}-drawtime-t{}-{}.bmp", shot_dir, frame_, slot, when));
+                  if (c.depth)
+                    DumpDepth(c.depth.get(), fmt::format("{}/glitch-{:06}-pitch-ds-{}-{}.bmp", shot_dir, frame_, ph, when));
+                }
+              }
+              if (glitch_events <= 6) {
+                for (size_t i = 0; i < prev_draw_log_.size(); ++i)
+                  REXLOG_INFO("copa glitch-draws before #{} {}: {}", frame_, i, prev_draw_log_[i]);
+                for (size_t i = 0; i < frame_draw_log_.size(); ++i)
+                  REXLOG_INFO("copa glitch-draws at #{} {}: {}", frame_, i, frame_draw_log_[i]);
+              }
+            }
+          }
+          glitch_prev = std::move(grid);
+        }
+        if (take_shot || !glitch_name.empty()) {
+#else /* street4 wc2010 */
+        if (take_shot) {
+#endif /* PORT_GAME */
+          // Diagnostics: write the guest front buffer as a 24-bit BMP (as presented).
+          char name[512];
+          snprintf(name, sizeof(name), "%s/frame-%06llu.bmp", shot_dir,
+                   static_cast<unsigned long long>(frame_));
+#if PORT_GAME == PORT_GAME_COPA2014
+          if (!glitch_name.empty()) snprintf(name, sizeof(name), "%s", glitch_name.c_str());
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+          std::ofstream f(name, std::ios::binary);
+          uint32_t w = td.Width, h = td.Height, row = (w * 3 + 3) & ~3u;
+          uint32_t size = 54 + row * h;
+          uint8_t hdr[54] = {'B', 'M'};
+          std::memcpy(hdr + 2, &size, 4);
+          uint32_t off = 54, dib = 40, planes_bpp = 1 | (24 << 16);
+          std::memcpy(hdr + 10, &off, 4);
+          std::memcpy(hdr + 14, &dib, 4);
+          std::memcpy(hdr + 18, &w, 4);
+          std::memcpy(hdr + 22, &h, 4);
+          std::memcpy(hdr + 26, &planes_bpp, 4);
+          f.write(reinterpret_cast<char*>(hdr), 54);
+          std::vector<uint8_t> line(row);
+          for (uint32_t y = 0; y < h; ++y) {
+            const uint8_t* p = static_cast<const uint8_t*>(m.pData) + (h - 1 - y) * m.RowPitch;
+            for (uint32_t x = 0; x < w; ++x) {
+              line[x * 3] = p[x * 4 + (src_bgra ? 0 : 2)];
+              line[x * 3 + 1] = p[x * 4 + 1];
+              line[x * 3 + 2] = p[x * 4 + (src_bgra ? 2 : 0)];
+            }
+            f.write(reinterpret_cast<char*>(line.data()), row);
+          }
+        }
+        context_->Unmap(staging.get(), 0);
+#if PORT_GAME == PORT_GAME_COPA2014
+        if ((frame_ % 120) == 0)
+          REXLOG_INFO("copa frame {}: front average rgba=({}, {}, {}, {})", frame_, sum[0] / n,
+#elif PORT_GAME == PORT_GAME_WC2010
+        REXLOG_INFO("wc2010 frame {}: front average rgba=({}, {}, {}, {})", frame_, sum[0] / n,
+#else /* street4 */
+        REXLOG_INFO("street4 frame {}: front average rgba=({}, {}, {}, {})", frame_, sum[0] / n,
+#endif /* PORT_GAME */
+                    sum[1] / n, sum[2] / n, sum[3] / n);
+      }
+    }
+  }
+  // Final picture, settings menu, vsync and frame pacing: pc_settings.cpp.
+  pcs::Picture picture;
+  if (src) {
+    picture.srv = src;
+    picture.width = float(desc.width);
+    picture.height = float(desc.height);
+    picture.u1 = float(desc.width) / sw;
+    picture.v1 = float(desc.height) / sh;
+    picture.swap_rb = src_bgra;
+  }
+  auto present_start = std::chrono::steady_clock::now();
+  pcs::Present(device_.get(), context_.get(), swap_chain_.get(), picture,
+               [this](ID3D11RenderTargetView** rtv, uint32_t* w, uint32_t* h) {
+                 if (!EnsureSwapChain()) return false;
+                 *rtv = backbuffer_rtv_.get();
+                 *w = bb_width_;
+                 *h = bb_height_;
+                 return true;
+               });
+  // A new internal resolution from the settings menu takes effect from the next frame: targets
+  // and resolve destinations of another scale are recreated as they are used.
+  if (float s = pcs::ResolutionScale(); s != scale_) {
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_INFO("copa renderer: internal resolution x{:.3f} -> x{:.3f}", scale_, s);
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_INFO("wc2010 renderer: internal resolution x{:.3f} -> x{:.3f}", scale_, s);
+#else /* street4 */
+    REXLOG_INFO("street4 renderer: internal resolution x{:.3f} -> x{:.3f}", scale_, s);
+#endif /* PORT_GAME */
+    scale_ = s;
+  }
+  // MSAA likewise: targets of another sample count are recreated as they are used.
+  UpdateMsaa();
+  if (frame_ % 1200 == 0 && single_copied_ + single_reused_) {
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_INFO("copa msaa single-sample copies: {} made, {} reused, {} rectangles", single_copied_, single_reused_,
+                rect_resolves_);
+    single_copied_ = single_reused_ = rect_resolves_ = 0;
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_INFO("wc2010 msaa single-sample copies: {} made, {} reused", single_copied_, single_reused_);
+    single_copied_ = single_reused_ = 0;
+#else /* street4 */
+    REXLOG_INFO("street4 msaa single-sample copies: {} made, {} reused", single_copied_, single_reused_);
+    single_copied_ = single_reused_ = 0;
+#endif /* PORT_GAME */
+  }
+  auto present_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - present_start).count();
+  static int slow_logs = 0;
+  if (present_ms > 100 && !pcs::MenuOpen() && slow_logs++ < 20)
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_WARN("copa present #{}: present took {} ms", frame_, present_ms);
+  static const bool frame_stats = std::getenv("COPA_FRAME_STATS") != nullptr;
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_WARN("wc2010 present #{}: present took {} ms", frame_, present_ms);
+  static const bool frame_stats = std::getenv("WC2010_FRAME_STATS") != nullptr;
+#else /* street4 */
+    REXLOG_WARN("street4 present #{}: present took {} ms", frame_, present_ms);
+  static const bool frame_stats = std::getenv("STREET4_FRAME_STATS") != nullptr;
+#endif /* PORT_GAME */
+  if (frame_stats && (frame_ % 30) < 4)
+#if PORT_GAME == PORT_GAME_COPA2014
+    REXLOG_INFO("copa frame-stats #{}: draws={} tiled_draws={} tilings={}", frame_, frame_draws_,
+#elif PORT_GAME == PORT_GAME_WC2010
+    REXLOG_INFO("wc2010 frame-stats #{}: draws={} tiled_draws={} tilings={}", frame_, frame_draws_,
+#else /* street4 */
+    REXLOG_INFO("street4 frame-stats #{}: draws={} tiled_draws={} tilings={}", frame_, frame_draws_,
+#endif /* PORT_GAME */
+                frame_tiled_draws_, frame_tilings_);
+  frame_draws_ = frame_tiled_draws_ = frame_tilings_ = 0;
+#if PORT_GAME == PORT_GAME_COPA2014
+  if (glitch_log_enabled_) {
+    prev_draw_log_.swap(frame_draw_log_);
+    frame_draw_log_.clear();
+    mask_snap_cur_ ^= 1;
+    pitch_srvs_[mask_snap_cur_].clear();
+    pitch_draws_[mask_snap_cur_] = 0;
+    for (auto& c : pitch_cap_[mask_snap_cur_]) c.valid = false;
+    for (auto& c : pitch_srv_cap_[mask_snap_cur_]) c.valid = false;
+    for (auto& t : snap_[mask_snap_cur_]) t.valid = false;
+  }
+#else /* street4 wc2010 */
+#endif /* PORT_GAME */
+  ExpireOnDemand();
+  DrainWriteBacks(false);
+  RenderProfile::Get().Frame();
+  ++frame_;
+  transient_next_ = 0;
+  // Drop resources unused for a while.
+  if ((frame_ & 255) == 0) {
+    for (auto it = textures_.begin(); it != textures_.end();)
+      it = (frame_ - it->second->last_used > 600) ? textures_.erase(it) : std::next(it);
+    for (auto it = vertex_buffers_.begin(); it != vertex_buffers_.end();)
+      it = (frame_ - it->second->last_used > 600) ? vertex_buffers_.erase(it) : std::next(it);
+    for (auto it = index_buffers_.begin(); it != index_buffers_.end();)
+      it = (frame_ - it->second->last_used > 600) ? index_buffers_.erase(it) : std::next(it);
+  }
+}
+
+}  // namespace
+
+// --------------------------------------------------------------------------- facade
+static RendererImpl& Impl() {
+  static RendererImpl impl;
+  return impl;
+}
+
+Renderer& Renderer::Get() {
+  static Renderer r;
+  return r;
+}
+void Renderer::Draw(const GuestDevice& d, const DrawRequest& r) {
+  ApiLock lock(ApiMutex());
+  Impl().Draw(d, r);
+}
+void Renderer::Resolve(const GuestDevice& d, const ResolveRequest& r) {
+  ApiLock lock(ApiMutex());
+  Impl().Resolve(d, r);
+}
+void Renderer::ClearBound(const GuestDevice& d, uint32_t c, const float rgba[4], bool z_, float z,
+                          bool s_, uint8_t s, const int32_t* rects, uint32_t rect_count) {
+  ApiLock lock(ApiMutex());
+  Impl().ClearBound(d, c, rgba, z_, z, s_, s, rects, rect_count);
+}
+void Renderer::Present(const uint8_t* fetch) {
+  ApiLock lock(ApiMutex());
+  Impl().Present(fetch);
+}
+void Renderer::SetTiling(bool active, uint32_t width, uint32_t height) {
+  ApiLock lock(ApiMutex());
+  Impl().SetTiling(active, width, height);
+}
+void Renderer::FlushWriteBacks(uint32_t fence) {
+  ApiLock lock(ApiMutex());
+  Impl().DrainWriteBacks(true, fence);
+}
+uint64_t Renderer::frame() const { return Impl().frame(); }
+bool Renderer::tracing() const { return TraceFrame(Impl().frame()); }
+
+#if PORT_GAME == PORT_GAME_COPA2014
+}  // namespace copa
+#elif PORT_GAME == PORT_GAME_WC2010
+}  // namespace wc2010
+#else /* street4 */
+}  // namespace street4
+#endif /* PORT_GAME */
