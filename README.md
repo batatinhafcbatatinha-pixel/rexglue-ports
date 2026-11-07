@@ -60,7 +60,7 @@ as before.
 | [Madagascar 3](games/madagascar3/) | Xbox 360 | reaches gameplay |
 | [2014 FIFA World Cup Brazil](games/copa2014/) | Xbox 360 | in progress |
 | [Doritos Crash Course](games/doritos/) | Xbox 360 (XBLA) | early work, not in the launcher yet |
-| [2010 FIFA World Cup South Africa](games/wc2010/) | Xbox 360 | early work, not in the launcher yet |
+| [2010 FIFA World Cup South Africa](games/wc2010/) | Xbox 360 | reaches a match, not in the launcher yet |
 
 Only these exact discs are supported (checked by SHA-256, see each `games/<game>/installer.json`). Each game folder
 has its own README with how to build and play it.
@@ -103,7 +103,7 @@ Each port at the furthest point it reaches today.
     <td align="center" width="50%">
       <img src="docs/screenshots/wc2010.jpg" alt="2010 FIFA World Cup South Africa" width="100%"><br>
       <b>2010 FIFA World Cup South Africa</b><br>
-      <sub>Xbox 360 &middot; choosing sides before a match</sub>
+      <sub>Xbox 360 &middot; a match, England against Germany</sub>
     </td>
   </tr>
   <tr>
