@@ -15,7 +15,7 @@ CDB = r'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
 CDB_COMMANDS = ['sxe -c ".echo ===AV===;r;kn 25;gn" av', 'sxd -c "gn" ch', 'sxi ld', 'g',
                 '.echo ===EXIT===', 'kn 30', 'q']
 DATA = Path(r'D:\CodexBuilds\doritos')
-BUILD = DATA / 'build' / 'win-amd64-release'
+BUILD = Path(os.environ.get('DORITOS_BUILD', DATA / 'build' / 'win-amd64-release'))
 EXE_NAME = 'doritoscrashcourse.exe'
 
 ap = argparse.ArgumentParser(description=__doc__)

@@ -645,6 +645,27 @@ REX_HOOK_RAW(sub_823C7460) {
   __imp__sub_823C7460(ctx, base);
   FlushVertices(d);
 }
+// DrawIndexedPrimitiveUP(device, prim, min_index, vertex_count, index_count, indices, index_format,
+// vertices, stride [stack +0x54]) = BeginIndexedVertices (0x823C74A8, not called elsewhere) + two
+// memcpy + the inline EndVertices. The game's 2D front end (menus, text) draws through it; it was
+// the only draw entry point the renderer did not see, so the menus were invisible. The source
+// arrays are read straight from the caller (index i addresses vertices + i * stride).
+REX_HOOK_RAW(sub_823C79C0) {
+  const uint32_t d = ctx.r3.u32;
+  m3gpu::UpDraw up;
+  up.indexed = true;
+  up.prim = ctx.r4.u32 & 63;
+  up.vertex_count = ctx.r5.u32 + ctx.r6.u32;
+  up.index_count = ctx.r7.u32;
+  up.indices = ctx.r8.u32;
+  up.index32 = (ctx.r9.u32 & 4) != 0;
+  up.vertices = ctx.r10.u32;
+  up.stride = Load(ctx.r1.u32 + 0x54);
+  FlushVertices(d);
+  __imp__sub_823C79C0(ctx, base);
+  up.pending = up.vertices && up.indices && up.index_count && up.stride && up.stride <= 256;
+  if (up.pending && !suppress_draws) { EnsureRenderer(); m3gpu::RendererDrawUp(d, up); }
+}
 // Clear(device, rect_count, rects*, flags, color(ARGB), z(f1), stencil); flags bits 0-3 render
 // targets, 0x10 depth, 0x20 stencil. Located from Copa 2014's 0x82468830 (same XDK library).
 // The library flushes a newly set render target into its register shadow (RB_COLOR_INFO) only

@@ -116,3 +116,12 @@ Pendências:
   `offset_pairs.py`; imagem decodificada em `D:\CodexBuilds\doritos\decoded`). EndVertices é inline no
   DrawPrimitiveUP `823C7460` (hook nele). Offsets a confirmar no teste: decl 0x2ED0, scratch 0x4230 (escrito por 823D9260).
 - Build na fila `D:/CodexBuilds/bq.sh` (log `D:\CodexBuilds\logs\doritos-build.out`). Nada testado ainda.
+
+## Renderer nativo: menus — 07/11 (Claude)
+- A tela inicial "travava" sem interface: a interface 2D desenha por DrawIndexedPrimitiveUP (`823C79C0`, sem hook) e por
+  DrawPrimitiveUP; com o device sem GPU, o espaço de vértices UP fica num buffer estático da imagem (`82FA5538`), sem
+  endereço físico, e o renderer lia o físico errado (`&0x1FFFFFFF`). Corrigido: hook de `823C79C0` (fontes do chamador)
+  e cópia dos vértices UP sem endereço físico para um anel físico (`renderer.cpp`). Menus, seleção de fase e USA 1 ok.
+- O A nunca foi ignorado: o jogo abria `menus/main/main`, só que invisível (e o `--nav` não via o aviso de sign-in).
+- Depuração: `scripts/run_test.py` aceita `DORITOS_BUILD=<pasta do exe>`; captura F12/`DORITOS_DEBUG_DRAWS` grava também
+  `alpha_tex_*.bmp`.

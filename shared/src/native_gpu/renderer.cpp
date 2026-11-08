@@ -2695,8 +2695,25 @@ void Renderer::Draw(uint32_t device, uint32_t prim, std::vector<uint32_t>& vids,
 #endif /* PORT_GAME */
   if (up) {
     // UP draws read their vertices from the command buffer through vertex fetch constant 95.
-    uint32_t phys = PhysOf(up->vertices);
+    uint32_t source = up->vertices;
     uint32_t bytes = up->vertex_count * up->stride;
+    // Doritos (GPU-less device) hands out UP vertex space in a static buffer of the executable
+    // image (0x82FA5538), which has no physical address: the shaders read guest physical memory,
+    // so such vertices are staged in a physical ring first (each draw its own range, so draws of
+    // one frame do not overwrite each other).
+    if (source >= kPhysicalSize && bytes && bytes <= (1u << 20) &&
+        Mem()->GetPhysicalAddress(source) == UINT32_MAX) {
+      static uint32_t ring = 0, offset = 0;
+      constexpr uint32_t kRing = 8u << 20;
+      if (!ring) ring = Mem()->SystemHeapAlloc(kRing, 0x1000, rex::memory::kSystemHeapPhysical);
+      if (ring) {
+        if (offset + bytes > kRing) offset = 0;
+        std::memcpy(Virt(ring + offset), Virt(source), bytes);
+        source = ring + offset;
+        offset = (offset + bytes + 255u) & ~255u;
+      }
+    }
+    uint32_t phys = PhysOf(source);
     st.xf[190] = (phys & ~3u) | 3u;
     st.xf[191] = (((bytes + 3) / 4) << 2) | 2u;
   }
@@ -3876,6 +3893,18 @@ void Renderer::WriteBmp(const std::string& name, const uint8_t* rgba, uint32_t p
   out.write(reinterpret_cast<const char*>(&fh), sizeof(fh));
   out.write(reinterpret_cast<const char*>(&ih), sizeof(ih));
   out.write(reinterpret_cast<const char*>(px.data()), std::streamsize(px.size()));
+  // Texture dumps of a capture also get their alpha channel as a grey picture (alpha_<name>).
+  if (name.rfind("tex_", 0) == 0) {
+    std::vector<uint8_t> alpha(size_t(w) * h * 4);
+    for (uint32_t y = 0; y < h; ++y)
+      for (uint32_t x = 0; x < w; ++x) {
+        const uint8_t a = rgba[size_t(pitch) * y + x * 4 + 3];
+        uint8_t* o = &alpha[(size_t(y) * w + x) * 4];
+        o[0] = o[1] = o[2] = a;
+        o[3] = 255;
+      }
+    WriteBmp("alpha_" + name, alpha.data(), w * 4, w, h);
+  }
 }
 
 // Debug aid: writes the back buffer to frame_<n>.bmp next to the executable.
