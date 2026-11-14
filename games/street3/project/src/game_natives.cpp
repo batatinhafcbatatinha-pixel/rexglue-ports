@@ -1,16 +1,15 @@
-// Native replacements for hot translated game functions (same results as the translated code).
+// Native fast paths for two hot game functions, described from their behaviour and built on the
+// standard library (not written from the translated code).
 //
-// sub_82474C50 is the game's memcpy (r3 = dst, r4 = src, r5 = bytes; returns r3 unchanged):
-// a forward copy, bytewise below 64 bytes and when the pointers are not word aligned, else
-// in 16-byte word groups. On big-endian memory a word copy moves the same bytes, so for
-// ranges that do not overlap (or dst <= src) the result is a plain memcpy/memmove. A dst
-// inside (src, src+n) depends on the copy granularity: that case runs the translated code.
-// It is ~17% of the render thread while movies play.
+// sub_82474C50 is the game's memcpy (r3 = dst, r4 = src, r5 = bytes; returns r3 unchanged). For
+// ranges that do not overlap (or where dst <= src) the result is the same as std::memmove of the
+// bytes; a destination inside (src, src+n) depends on the copy granularity, so that case runs the
+// translated code. It is ~17% of the render thread while movies play.
 //
-// sub_821F2370 is the qsort comparator of the render list (0x821F0074 sorts 4-byte entries
-// that point to 120-byte keys): a bytewise compare of the two keys, -1 if the first differing
-// byte of *r3 is smaller, 1 if larger, 0 if equal (unsigned bytes, i.e. memcmp order). ~22% of
-// the render thread in a match.
+// sub_821F2370 is the qsort comparator of the render list (0x821F0074 sorts 4-byte entries that
+// point to 120-byte keys). Its observable behaviour: -1 if the first differing byte of the first
+// key is smaller, 1 if larger, 0 if equal (unsigned bytes, i.e. memcmp order). ~22% of the render
+// thread in a match.
 //
 // FS3_NO_NATIVE_MEMCPY=1  translated memcpy only
 // FS3_NO_NATIVE_SORTKEY=1 translated comparator only

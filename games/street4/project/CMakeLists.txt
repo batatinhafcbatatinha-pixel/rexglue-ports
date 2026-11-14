@@ -33,6 +33,13 @@ target_include_directories(fifastreet4 PRIVATE src)
 # No GPU_PLUGINS: the Xenos emulation plugin is intentionally not staged.
 rexglue_setup_target(fifastreet4)
 
+# Hand-written native versions of game functions are not published: they live in the git-ignored
+# src/native/local/game_natives.cpp, which replaces the published src/native/game_natives.cpp when it exists.
+set(FIFASTREET4_GAME_NATIVES src/native/game_natives.cpp)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/native/local/game_natives.cpp")
+  set(FIFASTREET4_GAME_NATIVES src/native/local/game_natives.cpp)
+endif()
+
 # Hooks on functions of the game module must be compiled into that module.
 if(TARGET fifastreet4_fifadllzf_xex)
     target_sources(fifastreet4_fifadllzf_xex PRIVATE
@@ -44,7 +51,7 @@ if(TARGET fifastreet4_fifadllzf_xex)
         ${PORTS_SHARED}/src/native/texture_loader.cpp
         ${PORTS_SHARED}/src/native/native_audio.cpp
         ${PORTS_SHARED}/src/native/game_log.cpp
-        src/native/game_natives.cpp
+        ${FIFASTREET4_GAME_NATIVES}
         ${PORTS_SHARED}/src/pc_settings.cpp
         src/pc_theme.cpp
         ${PORTS_SHARED}/src/pc_font.cpp

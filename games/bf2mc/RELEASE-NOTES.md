@@ -25,9 +25,9 @@ Vibration has been compiled but not felt on a real controller yet. Nobody has pl
 
 **v0.2.2**
 
-- **Untested code in this release:** the native effect parameter commit (`sub_824F4770`) is compiled and on by default, but it has never been run. If a mission breaks or effects look wrong, set `BF2_NO_NATIVE_COMMIT=1`.
+- **Note on the figures below:** they were measured with local builds that also replaced some hot game functions with hand-written native versions (constant store, parameter lookup and commit, particle vertex writer, vec3 normalize). The published source does not include those replacements; the translated functions run instead.
 - The shadow map no longer uses MSAA, and whole surfaces use the hardware resolve. At 4K, 16x anisotropic filtering, no frame limit, in the light stretch of the first mission (Ryzen 5 3600, RTX 3050 Laptop), without MSAA / 2x / 4x / 8x: 79/75/68/56 fps before, 79/76/71/63 fps now. Measured before the untested code above went in. The heavy stretch stays at about 50 fps.
-- Float constants travel as changed blocks; native constant store, parameter lookup, particle vertex writer and vec3 normalize.
+- Float constants travel as changed blocks. (Hand-written native versions of the constant store, parameter lookup, particle vertex writer and vec3 normalize were part of the local builds; they are not in the published source.)
 - 7e3 render target limits applied to pixel shader output.
 - PC settings menu reads every SDL pad; controller mappings sit next to the executable.
 - The game keeps running when the audio device stops consuming.

@@ -15,11 +15,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(generated/rexglue.cmake)
 
+# Hand-written native versions of game functions are not published: they live in the git-ignored
+# local/game_natives.cpp, which replaces the published src/game_natives.cpp when it exists.
+set(BF2MC_GAME_NATIVES src/game_natives.cpp)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/local/game_natives.cpp")
+  set(BF2MC_GAME_NATIVES local/game_natives.cpp)
+endif()
+
 # Sources
 set(BF2MC_SOURCES
     src/main.cpp
     src/hooks.cpp
-    src/game_natives.cpp
+    ${BF2MC_GAME_NATIVES}
     src/input_remap.cpp
     src/menu_hooks.cpp
     src/apt_menu.cpp
