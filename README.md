@@ -117,6 +117,6 @@ Each port at the furthest point it reaches today.
 
 ## License
 
-The ports' own code and tooling: MIT ([LICENSE](LICENSE)); third-party notices in each game's `NOTICE.md` and
+The ports' own code and tooling: MIT ([LICENSE](LICENSE)); third-party notices in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), each game's `NOTICE.md` and
 `licenses/`. The games, their code, trademarks and assets belong to their publishers and rights holders; these
 ports are not affiliated with or endorsed by them or by Microsoft.
