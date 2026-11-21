@@ -2,9 +2,9 @@
 
 **Download:** [Windows](https://github.com/batatinhafcbatatinha-pixel/rexglue-ports/releases/latest/download/rexglue-ports-windows.zip) (source + `Launcher.exe`: unzip, open `Launcher.exe`) · [Linux](https://github.com/batatinhafcbatatinha-pixel/rexglue-ports/releases/latest/download/rexglue-ports-linux.zip) (source only, LF line endings, no launcher: build as the game's README says under Linux). No macOS ZIP yet: its build files are untested.
 
-Native PC ports of Xbox 360 games, built from **your own disc** on top of the
-[ReXGlue](https://github.com/rexglue) static recompiler (PowerPC to C++). No game content is stored here: no disc
-image, executable, game data or generated code.
+Native PC ports of Xbox 360 games, **built from your own disc** on top of the
+[ReXGlue](https://github.com/rexglue) static recompiler (PowerPC to C++). **No game content is stored here: no disc
+image, executable, game data or generated code.**
 
 What the ports add on top of the recompiled code is native: a Direct3D 11 renderer (also on Vulkan through DXVK,
 DXVK native on Linux, DXMT on macOS), XMA audio decoded on the host, the in-game PC settings menu (F1) and
@@ -29,52 +29,6 @@ Windows 10/11 x64. About 15 GB free and 15-60 minutes for the first build of a g
    frame limit, internal resolution, MSAA, effects, controls, language, volume.
 
 Each game folder also keeps its own `Setup.cmd`, which does the same for that one game.
-
-## Layout
-
-| Folder | What it holds |
-| --- | --- |
-| [`games/`](games/) | one folder per game: its manifest, hooks, game-specific native code, build and play scripts |
-| [`shared/src/`](shared/src/) | the native layers the games share (see below) |
-| `tools/port-installer` | the game-file installer / launcher (submodule: `git submodule update --init`) |
-| `launcher.json`, `Launcher.cmd` | the launcher's list of games and its download script |
-
-Shared layers (`shared/src`):
-
-- `platform/` - window, shader compiler, Win32 subset for Linux/macOS, fonts
-- `pc_settings.*`, `pc_font.*`, `script_input.h` - the PC settings menu (each game keeps its own `pc_theme.cpp` look)
-- `native_audio/` - XMA decoding and audio output (FIFA Street 3, BF2: Modern Combat, Madagascar 3, Doritos)
-- `native_gpu/` - the Xenos renderer of Madagascar 3, BF2: Modern Combat and Doritos
-- `native/` - the renderer and audio of the FIFA Street 2012 engine family (FIFA Street, 2014 FIFA World Cup, 2010 FIFA World Cup)
-
-Each game's `project/src/port_game.h` sets `PORT_GAME` (ids in `shared/src/port_games.h`) and the guest addresses
-the shared code needs; behaviour that differs between games is selected with `#if PORT_GAME == PORT_GAME_<NAME>`.
-The shared files were merged from the games' former copies and checked so that every game compiles the same code
-as before.
-
-## Games
-
-| Game | Disc | State |
-| --- | --- | --- |
-| [FIFA Street 3](games/street3/) | Xbox 360 | playable |
-| [FIFA Street (2012)](games/street4/) | Xbox 360 | playable |
-| [Battlefield 2: Modern Combat](games/bf2mc/) | Xbox 360 | playable |
-| [Madagascar 3](games/madagascar3/) | Xbox 360 | reaches gameplay |
-| [2014 FIFA World Cup Brazil](games/copa2014/) | Xbox 360 | in progress |
-| [Doritos Crash Course](games/doritos/) | Xbox 360 (XBLA) | menus and first level on the native renderer, not in the launcher yet |
-| [2010 FIFA World Cup South Africa](games/wc2010/) | Xbox 360 | reaches a match, not in the launcher yet |
-
-These exact discs have a port (checked by SHA-256, see each `games/<game>/installer.json`). Each game folder
-has its own README with how to build and play it.
-
-**Any other Xbox 360 disc** goes through the generic path ([`tools/x360port`](tools/x360port/x360port.py)): the
-launcher shows it as **BUILD (GENERIC)** and builds it with the ReXGlue SDK's own project template (`rexglue init`,
-`rexglue codegen`) and runtime, whose Xenos GPU emulation stands in for the native renderers the ports above have.
-Branch targets the analysis finds outside every function are declared in the manifest and the translation runs again
-by itself; functions a run calls that the analysis missed are recorded in the game's log and declared for the next
-build. It compiles with LLVM alone (clang + lld, no Visual Studio): the MSVC runtime and Windows SDK the SDK's
-libraries need are fetched with [xwin](https://github.com/Jake-Shadle/xwin) into `.local/xwin`. Games without a port
-may not work or may stop somewhere. Tested so far: Skate 3 translates, compiles and starts running its code.
 
 ## Screenshots
 
@@ -125,6 +79,28 @@ Each port at the furthest point it reaches today.
     </td>
   </tr>
 </table>
+
+## Layout
+
+| Folder | What it holds |
+| --- | --- |
+| [`games/`](games/) | one folder per game: its manifest, hooks, game-specific native code, build and play scripts |
+| [`shared/src/`](shared/src/) | the native layers the games share (see below) |
+| `tools/port-installer` | the game-file installer / launcher (submodule: `git submodule update --init`) |
+| `launcher.json`, `Launcher.cmd` | the launcher's list of games and its download script |
+
+Shared layers (`shared/src`):
+
+- `platform/` - window, shader compiler, Win32 subset for Linux/macOS, fonts
+- `pc_settings.*`, `pc_font.*`, `script_input.h` - the PC settings menu (each game keeps its own `pc_theme.cpp` look)
+- `native_audio/` - XMA decoding and audio output (FIFA Street 3, BF2: Modern Combat, Madagascar 3, Doritos)
+- `native_gpu/` - the Xenos renderer of Madagascar 3, BF2: Modern Combat and Doritos
+- `native/` - the renderer and audio of the FIFA Street 2012 engine family (FIFA Street, 2014 FIFA World Cup, 2010 FIFA World Cup)
+
+Each game's `project/src/port_game.h` sets `PORT_GAME` (ids in `shared/src/port_games.h`) and the guest addresses
+the shared code needs; behaviour that differs between games is selected with `#if PORT_GAME == PORT_GAME_<NAME>`.
+The shared files were merged from the games' former copies and checked so that every game compiles the same code
+as before.
 
 ## License
 
