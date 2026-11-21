@@ -69,7 +69,8 @@
     ],
     "retry_if": "build/build.ninja"
    }
-  ]
+  ],
+  "buildtools": false
  },
  "generic_label": "^[0-9A-F]{8}$"
 }

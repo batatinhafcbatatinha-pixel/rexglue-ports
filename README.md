@@ -71,8 +71,10 @@ has its own README with how to build and play it.
 launcher shows it as **BUILD (GENERIC)** and builds it with the ReXGlue SDK's own project template (`rexglue init`,
 `rexglue codegen`) and runtime, whose Xenos GPU emulation stands in for the native renderers the ports above have.
 Branch targets the analysis finds outside every function are declared in the manifest and the translation runs again
-by itself. Games without a port may not work or may stop somewhere. Tested so far: Skate 3 translates; compiling needs
-the Visual Studio C++ Build Tools (the SDK's libraries are MSVC builds).
+by itself; functions a run calls that the analysis missed are recorded in the game's log and declared for the next
+build. It compiles with LLVM alone (clang + lld, no Visual Studio): the MSVC runtime and Windows SDK the SDK's
+libraries need are fetched with [xwin](https://github.com/Jake-Shadle/xwin) into `.local/xwin`. Games without a port
+may not work or may stop somewhere. Tested so far: Skate 3 translates, compiles and starts running its code.
 
 ## Screenshots
 

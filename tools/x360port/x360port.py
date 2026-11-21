@@ -8,9 +8,13 @@ and its runtime, Xenos GPU emulation included (the ports in games/ replace that 
 keeps it). A port folder holds game_files/ (the disc, copied and checked by the launcher). Generated files go to
 <port>/project (the ReXGlue project) and <port>/build. Steps (each skips itself when done; --force redoes it):
   sdk        the pinned ReXGlue SDK (tools/x360port/sdk.json), once for the repository (.local/sdk)
+  msvcsdk    Windows: the MSVC C/C++ runtime and the Windows SDK the SDK's libraries were built against, fetched
+             with xwin (pinned, SHA-256 checked) into .local/xwin, so LLVM (clang + lld) builds without Visual Studio
+  learn      functions a run called that the analysis did not find (the runtime's "[FATAL] Call to invalid or
+             unregistered function" in build/logs) are declared in the manifest: the next build includes them
   init       rexglue init: the project and manifest for the game's default.xex
   codegen    rexglue codegen: the game's PowerPC code as C++
-  prepare    sdk init codegen
+  prepare    sdk msvcsdk init learn codegen
   compile    compile and link build/game.exe
   play       run the game
 """
@@ -36,6 +40,15 @@ if sys.platform == 'darwin':
 elif os.name != 'nt':
     SDK = {**SDK, **PIN['sdk_linux']}
 EXE = '.exe' if os.name == 'nt' else ''
+XWIN_VERSION = '0.10.0'
+XWIN_URL = (f'https://github.com/Jake-Shadle/xwin/releases/download/{XWIN_VERSION}/'
+            f'xwin-{XWIN_VERSION}-x86_64-pc-windows-msvc.tar.gz')
+XWIN_SHA256 = '96e83665ef5c1406aabd0be603a8d08e67e604f36fda630b6807ee948a614e26'
+XWIN = LOCAL / 'xwin'
+# What a build needs from xwin's output; its last step (a convenience symlink) fails without the Windows
+# symlink privilege, which these files do not depend on.
+XWIN_NEEDED = ('crt/include/vcruntime.h', 'crt/lib/x86_64/msvcrt.lib', 'sdk/include/um/windows.h',
+               'sdk/include/ucrt/stdio.h', 'sdk/lib/um/x86_64/kernel32.lib', 'sdk/lib/ucrt/x86_64/ucrt.lib')
 NAME = 'game'   # the CMake target and executable of every generic port
 
 
@@ -100,6 +113,49 @@ def step_sdk(port, args):
     log('- ReXGlue SDK: ' + str(prefix))
 
 
+def msvc_env_present():
+    """A Visual Studio developer environment (vcvars) is already loaded."""
+    return any((Path(d) / 'vcruntime.h').is_file() for d in os.environ.get('INCLUDE', '').split(';') if d)
+
+
+def step_msvcsdk(port, args):
+    if os.name != 'nt' or msvc_env_present():
+        return
+    if all((XWIN / f).is_file() for f in XWIN_NEEDED) and not args.force:
+        log('- MSVC runtime and Windows SDK (xwin): already fetched')
+        return
+    import tarfile
+    work = LOCAL / 'xwin-dl'
+    exe = next(work.glob('*/xwin.exe'), None) if work.is_dir() else None
+    if not exe:
+        log(f'Downloading xwin {XWIN_VERSION} (fetches the MSVC runtime and Windows SDK from Microsoft)')
+        work.mkdir(parents=True, exist_ok=True)
+        archive = work / 'xwin.tar.gz'
+        with urllib.request.urlopen(urllib.request.Request(XWIN_URL, headers={'User-Agent': 'x360port'}), timeout=300) as r:
+            archive.write_bytes(r.read())
+        if hashlib.sha256(archive.read_bytes()).hexdigest() != XWIN_SHA256:
+            archive.unlink()
+            raise SystemExit('xwin download damaged or changed (SHA-256 mismatch); run Setup again')
+        with tarfile.open(archive) as t:
+            t.extractall(work)
+        exe = next(work.glob('*/xwin.exe'))
+    # Accepting the license here is what installing the Visual Studio Build Tools would ask for: the same files.
+    subprocess.run([str(exe), '--accept-license', '--arch', 'x86_64', '--cache-dir', str(LOCAL / 'xwin-cache'),
+                    'splat', '--disable-symlinks', '--output', str(XWIN)])
+    missing = [f for f in XWIN_NEEDED if not (XWIN / f).is_file()]
+    if missing:
+        raise SystemExit('xwin did not produce ' + ', '.join(missing))
+    log('- MSVC runtime and Windows SDK: ' + str(XWIN))
+
+
+def xwin_env():
+    """INCLUDE / LIB for clang and lld over the xwin output (what vcvars would set)."""
+    inc = ['crt/include', 'sdk/include/ucrt', 'sdk/include/um', 'sdk/include/shared', 'sdk/include/winrt',
+           'sdk/include/cppwinrt']
+    lib = ['crt/lib/x86_64', 'sdk/lib/um/x86_64', 'sdk/lib/ucrt/x86_64']
+    return {'INCLUDE': ';'.join(str(XWIN / d) for d in inc), 'LIB': ';'.join(str(XWIN / d) for d in lib)}
+
+
 def rexglue():
     return sdk_prefix() / 'bin' / ('rexglue' + EXE)
 
@@ -117,6 +173,7 @@ def step_init(port, args):
          '--project-root', port.project, '--scan-dll'], cwd=port.dir)
 
 
+RUNTIME_MISSING = re.compile(r'Call to invalid or unregistered function at guest address (0x[0-9A-Fa-f]{8})')
 UNRESOLVED = re.compile(r'^\s*(0x[0-9A-Fa-f]{8}) from 0x[0-9A-Fa-f]+: .*target not in any function', re.M)
 
 
@@ -135,9 +192,25 @@ def declare_functions(manifest, addresses):
     if '[entrypoint.functions]' in text:
         text = text.replace('[entrypoint.functions]\n', '[entrypoint.functions]\n' + lines, 1)
     else:
-        text = text.rstrip('\n') + '\n\n[entrypoint.functions]\n# Targets the analysis reached by a branch but found in no function (added by x360port)\n' + lines
+        text = text.rstrip('\n') + '\n\n[entrypoint.functions]\n# Entry points the analysis missed: branch targets outside every function and calls a run reported (x360port)\n' + lines
     manifest.write_text(text, encoding='utf-8')
     return len(new)
+
+
+def step_learn(port, args):
+    logs = sorted((port.build / 'logs').glob('*.log')) if (port.build / 'logs').is_dir() else []
+    found = []
+    for f in logs:
+        found += RUNTIME_MISSING.findall(f.read_text(encoding='utf-8', errors='replace'))
+    if not found or not port.manifest.is_file():
+        log('- functions found missing by a run: nothing new')
+        return
+    added = declare_functions(port.manifest, found)
+    if added:
+        port.stamp.unlink(missing_ok=True)       # the translation runs again with them
+        log(f'{added} function(s) a run found missing declared in {port.manifest.name}')
+    else:
+        log('- functions found missing by a run: all declared already')
 
 
 def step_codegen(port, args):
@@ -170,7 +243,7 @@ def step_codegen(port, args):
 
 
 def step_prepare(port, args):
-    for step in (step_sdk, step_init, step_codegen):
+    for step in (step_sdk, step_msvcsdk, step_init, step_learn, step_codegen):
         step(port, args)
 
 
@@ -180,8 +253,15 @@ def step_compile(port, args):
         clang = shutil.which('clang-20') or clang
         clangxx = shutil.which('clang++-20') or clangxx
     need('cmake'), need('ninja')
+    extra = []
+    if os.name == 'nt' and not msvc_env_present():
+        # LLVM alone: clang for the MSVC target with lld, over the MSVC runtime and Windows SDK from xwin.
+        step_msvcsdk(port, args)
+        os.environ.update(xwin_env())
+        extra = ['-DCMAKE_LINKER_TYPE=LLD', '-DCMAKE_RC_COMPILER=llvm-rc',
+                 '-DCMAKE_TRY_COMPILE_CONFIGURATION=Release']   # xwin brings the release runtime only
     run(['cmake', '-S', port.project, '-B', port.build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=RelWithDebInfo',
-         '-DCMAKE_C_COMPILER=' + clang, '-DCMAKE_CXX_COMPILER=' + clangxx,
+         '-DCMAKE_C_COMPILER=' + clang, '-DCMAKE_CXX_COMPILER=' + clangxx, *extra,
          '-DCMAKE_PREFIX_PATH=' + sdk_prefix().as_posix(), '-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=' + port.build.as_posix()])
     run(['cmake', '--build', port.build, '--parallel', str(args.jobs), '--target', NAME])
 
@@ -193,7 +273,7 @@ def step_play(port, args):
     sys.exit(r.returncode)
 
 
-STEPS = {'sdk': step_sdk, 'init': step_init, 'codegen': step_codegen, 'prepare': step_prepare,
+STEPS = {'sdk': step_sdk, 'msvcsdk': step_msvcsdk, 'init': step_init, 'learn': step_learn, 'codegen': step_codegen, 'prepare': step_prepare,
          'compile': step_compile, 'play': step_play,
          'all': lambda p, a: (step_prepare(p, a), step_compile(p, a))}
 
