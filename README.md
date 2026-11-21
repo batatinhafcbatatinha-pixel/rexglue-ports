@@ -64,8 +64,15 @@ as before.
 | [Doritos Crash Course](games/doritos/) | Xbox 360 (XBLA) | menus and first level on the native renderer, not in the launcher yet |
 | [2010 FIFA World Cup South Africa](games/wc2010/) | Xbox 360 | reaches a match, not in the launcher yet |
 
-Only these exact discs are supported (checked by SHA-256, see each `games/<game>/installer.json`). Each game folder
+These exact discs have a port (checked by SHA-256, see each `games/<game>/installer.json`). Each game folder
 has its own README with how to build and play it.
+
+**Any other Xbox 360 disc** goes through the generic path ([`tools/x360port`](tools/x360port/x360port.py)): the
+launcher shows it as **BUILD (GENERIC)** and builds it with the ReXGlue SDK's own project template (`rexglue init`,
+`rexglue codegen`) and runtime, whose Xenos GPU emulation stands in for the native renderers the ports above have.
+Branch targets the analysis finds outside every function are declared in the manifest and the translation runs again
+by itself. Games without a port may not work or may stop somewhere. Tested so far: Skate 3 translates; compiling needs
+the Visual Studio C++ Build Tools (the SDK's libraries are MSVC builds).
 
 ## Screenshots
 

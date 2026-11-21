@@ -29,5 +29,47 @@
    }
   ]
  },
- "groups": []
+ "groups": [],
+ "generic": {
+  "play": "Play.cmd",
+  "play_cmd": "@echo off\r\nrem Starts this game (built by the launcher with tools/x360port).\r\npython \"%~dp0..\\..\\..\\tools\\x360port\\x360port.py\" play --port \"%~dp0.\" %*\r\nexit /b %errorlevel%\r\n",
+  "exe": "build/game.exe",
+  "disk_gb": 15,
+  "download_gb": 1,
+  "minutes": "15-60",
+  "tools": [
+   "llvm",
+   "cmake",
+   "ninja"
+  ],
+  "gb_per_job": 2,
+  "steps": [
+   {
+    "name": "Translate your game (ReXGlue)",
+    "run": [
+     "{python}",
+     "../../../tools/x360port/x360port.py",
+     "prepare",
+     "--port",
+     "{root}"
+    ],
+    "done_if": "build/codegen-complete.json",
+    "prepare": true
+   },
+   {
+    "name": "Compile",
+    "run": [
+     "{python}",
+     "../../../tools/x360port/x360port.py",
+     "compile",
+     "--port",
+     "{root}",
+     "--jobs",
+     "{jobs}"
+    ],
+    "retry_if": "build/build.ninja"
+   }
+  ]
+ },
+ "generic_label": "^[0-9A-F]{8}$"
 }
