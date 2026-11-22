@@ -288,8 +288,12 @@ def step_learn(port, args):
 
 def step_codegen(port, args):
     if port.stamp.is_file() and not args.force:
-        log('- translated code: already done')
-        return
+        # Code translated before this check existed can still hold functions cut short: they do not compile.
+        ends = function_ends_to_extend(port)
+        if not ends:
+            log('- translated code: already done')
+            return
+        set_function_ends(port.manifest, ends)
     port.stamp.unlink(missing_ok=True)
     run_codegen(port)
     # Functions the analysis ended at a blr in their middle, with branches of their own past it: their real end
@@ -418,16 +422,33 @@ def function_ends_to_extend(port):
         starts.update(int(m, 16) for m in re.findall(r'SetFunction\(0x([0-9A-Fa-f]+)', f.read_text(encoding='utf-8')))
     starts = sorted(starts)
     ends = {}
+
+    def extend(a, b):
+        i = bisect.bisect_right(starts, a) - 1
+        if i < 0 or i + 1 >= len(starts):
+            return
+        s, n = starts[i], starts[i + 1]
+        if s <= min(a, b) and max(a, b) < n:
+            ends[s] = n
+
     for f in gen.glob('*.cpp'):
-        for a, b in re.findall(r'Unresolved branch from 0x([0-9A-Fa-f]+) to 0x([0-9A-Fa-f]+)',
-                               f.read_text(encoding='utf-8', errors='replace')):
-            a, b = int(a, 16), int(b, 16)
-            i = bisect.bisect_right(starts, a) - 1
-            if i < 0 or i + 1 >= len(starts):
+        text = f.read_text(encoding='utf-8', errors='replace')
+        for a, b in re.findall(r'Unresolved branch from 0x([0-9A-Fa-f]+) to 0x([0-9A-Fa-f]+)', text):
+            extend(int(a, 16), int(b, 16))
+        # The same cut without the comment: a goto to a label the function does not hold (the code past the end the
+        # analysis found), which does not compile.
+        # A function can also hold the start of another one (an entry the analysis registered inside it), so the new
+        # end is the first function after its last label, not after its start.
+        parts = re.split(r'^DEFINE_REX_FUNC\(sub_([0-9A-Fa-f]{8})\)', text, flags=re.M)
+        for k in range(1, len(parts) - 1, 2):
+            s, body = int(parts[k], 16), parts[k + 1]
+            labels = {int(x, 16) for x in re.findall(r'^loc_([0-9A-Fa-f]{8}):', body, re.M)}
+            missing = {int(x, 16) for x in re.findall(r'goto loc_([0-9A-Fa-f]{8});', body)} - labels
+            if not missing:
                 continue
-            s, n = starts[i], starts[i + 1]
-            if s <= min(a, b) and max(a, b) < n:
-                ends[s] = n
+            i = bisect.bisect_right(starts, max(labels | {s}))
+            if i < len(starts) and s <= min(missing) and max(missing) < starts[i]:
+                ends[s] = starts[i]
     return ends
 
 
