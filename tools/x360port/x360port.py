@@ -488,7 +488,10 @@ def remove_functions(manifest, addresses):
 def step_play(port, args):
     if not port.exe.is_file():
         raise SystemExit('The game is not built yet: install it from the launcher.')
-    r = subprocess.run([str(port.exe), '--game_data_root=' + str(port.files)] + args.extra, cwd=port.exe.parent)
+    # Xbox Live Arcade games check their license and run as a trial without one (the runtime's default, 0): the
+    # player's own package is the full game.
+    licensed = [] if any(a.startswith('--license_mask') for a in args.extra) else ['--license_mask=1']
+    r = subprocess.run([str(port.exe), '--game_data_root=' + str(port.files)] + licensed + args.extra, cwd=port.exe.parent)
     sys.exit(r.returncode)
 
 
