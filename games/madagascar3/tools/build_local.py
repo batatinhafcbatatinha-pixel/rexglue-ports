@@ -60,6 +60,10 @@ def prepare_sdk(local, sdk_dir):
             archive = download(SDK['url'], local / 'downloads' / Path(SDK['url']).name, SDK['sha256'])
             with zipfile.ZipFile(archive) as bundle:
                 bundle.extractall(local / 'sdk')
+    if os.name != 'nt':
+        tool = prefix / 'bin/rexglue'
+        if tool.is_file():
+            tool.chmod(tool.stat().st_mode | 0o111)
     if not (prefix / 'lib/cmake/rexglue').is_dir():
         raise ValueError(f'{prefix} is not a ReXGlue SDK install (lib/cmake/rexglue missing)')
     # Keep host floating-point exceptions masked when the guest writes FPSCR (see patches/).
@@ -221,7 +225,7 @@ def main():
         clangxx = shutil.which('clang++-20', path=env.get('PATH')) or clangxx
         if MACOS and not (args.dxmt_dir and args.vkd3d_dir):
             raise ValueError('macOS: pass --dxmt-dir and --vkd3d-dir (see MACOS.md)')
-        if not MACOS and not args.dxvk_native_dir:
+        if not MACOS and not (args.dxvk_native_dir and args.vkd3d_dir):
             raise ValueError('Linux: pass --dxvk-native-dir (DXVK native 3.1.1, D3D11 on Vulkan) and --vkd3d-dir')
         if args.vkd3d_dir:
             pkg = [str(args.vkd3d_dir.resolve() / d / 'pkgconfig') for d in ('lib', 'lib64', 'lib/x86_64-linux-gnu')]

@@ -25,6 +25,8 @@ def main():
     executable = args.local_dir.resolve() / 'build' / (KIT['target'] + ('.exe' if os.name == 'nt' else ''))
     if not executable.is_file():
         parser.error('Build first: python tools/build_local.py --game-files ' + str(game_files))
+    if os.name != 'nt' and args.extra[:1] == ['--']:
+        args.extra = args.extra[1:]
     command = [str(executable), '--game_data_root=' + str(game_files)] + KIT.get('play_args', []) + args.extra
     raise SystemExit(subprocess.call(command, cwd=executable.parent))
 

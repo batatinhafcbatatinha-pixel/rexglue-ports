@@ -1,0 +1,32 @@
+name: Native source checks
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  source:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install build tools
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update
+            sudo apt-get install -y clang ninja-build
+          else
+            brew install ninja
+          fi
+      - name: Check Python, shell and JSON syntax
+        shell: bash
+        run: |
+          python3 -m compileall -q tools/native_profile.py tools/x360port games
+          find games -name '*.sh' -print0 | xargs -0 -n 1 bash -n
+          python3 -c 'import json,pathlib; [json.loads(p.read_text()) for p in [pathlib.Path("launcher.json"), *pathlib.Path("games").glob("*/setup.json")]]'
+      - name: Configure source checks
+        run: cmake -S tools/native-ci -B .local/native-ci -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
+      - name: Build source checks
+        run: cmake --build .local/native-ci --parallel 2
+      - name: Run source checks
+        run: ctest --test-dir .local/native-ci --output-on-failure

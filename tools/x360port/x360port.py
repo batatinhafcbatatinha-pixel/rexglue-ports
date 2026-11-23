@@ -187,6 +187,10 @@ def step_sdk(port, args):
             z.extractall(LOCAL / 'sdk')
     if not (prefix / 'lib/cmake/rexglue').is_dir():
         raise SystemExit(f'{prefix} is not a ReXGlue SDK install (lib/cmake/rexglue missing)')
+    if os.name != 'nt':
+        tool = prefix / 'bin/rexglue'
+        if tool.is_file():
+            tool.chmod(tool.stat().st_mode | 0o111)
     # The same header patches as the ports (keep host floating-point exceptions masked when the guest writes FPSCR).
     for patch in SDK.get('patches', []):
         header = prefix / patch['file']
@@ -758,7 +762,8 @@ def step_play(port, args):
     if native_vulkan and not any(a.startswith('--gpu_backend') for a in args.extra):
         # The runtime has its own Vulkan renderer (sdkvk): no translation layer.
         video.append('--gpu_backend=' + ('vulkan' if want_vulkan else 'd3d12'))
-    vulkan_layer.stage(port.exe.parent, 'd3d12', want_vulkan and not native_vulkan, REPO / '.local/downloads/vulkan')
+    if os.name == 'nt':
+        vulkan_layer.stage(port.exe.parent, 'd3d12', want_vulkan and not native_vulkan, REPO / '.local/downloads/vulkan')
     r = subprocess.run([str(port.exe), '--game_data_root=' + str(port.files)] + licensed + video + args.extra,
                        cwd=port.exe.parent)
     sys.exit(r.returncode)
@@ -770,6 +775,10 @@ STEPS = {'sdk': step_sdk, 'sdkvk': step_sdkvk, 'msvcsdk': step_msvcsdk, 'init': 
 
 
 def main():
+    if os.name != 'nt':
+        sys.path.insert(0, str(REPO / 'tools'))
+        from native_profile import environment
+        os.environ.update(environment())
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('step', choices=STEPS)
     ap.add_argument('--port', default='.')

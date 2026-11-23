@@ -13,14 +13,23 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include <string_view>
 #include "xenos_hlsl.h"
 
 namespace fs = std::filesystem;
 using Microsoft::WRL::ComPtr;
 
+#ifdef _WIN32
+using ArgumentView = std::wstring_view;
+#define ARGUMENT_TEXT(value) L##value
 int wmain(int argc, wchar_t** argv) {
-  if (argc != 4 || (std::wstring_view(argv[1]) != L"vs" &&
-                    std::wstring_view(argv[1]) != L"ps")) {
+#else
+using ArgumentView = std::string_view;
+#define ARGUMENT_TEXT(value) value
+int main(int argc, char** argv) {
+#endif
+  if (argc != 4 || (ArgumentView(argv[1]) != ARGUMENT_TEXT("vs") &&
+                    ArgumentView(argv[1]) != ARGUMENT_TEXT("ps"))) {
 #if PORT_GAME == PORT_GAME_DORITOS
     std::cerr << "Usage: doritos_shaderc vs|ps <big-endian-microcode> <new-output-directory>\n";
 #else /* madagascar3 */
@@ -29,7 +38,7 @@ int wmain(int argc, wchar_t** argv) {
     return 2;
   }
   try {
-    const bool pixel = std::wstring_view(argv[1]) == L"ps";
+    const bool pixel = ArgumentView(argv[1]) == ARGUMENT_TEXT("ps");
     const fs::path input(argv[2]), output(argv[3]);
     if (!fs::is_regular_file(input) || fs::exists(output)) {
       std::cerr << "Input must be a file; output directory must be new.\n";

@@ -52,8 +52,10 @@ endif()
 rexglue_setup_target(bf2mc)
 
 # Line tables for the hand-written sources (profiling); the generated code stays as configured.
+if(WIN32)
 set_source_files_properties(${PORTS_SHARED}/src/native_gpu/renderer.cpp ${PORTS_SHARED}/src/native_gpu/textures.cpp ${PORTS_SHARED}/src/native_gpu/gpu_hooks.cpp
     ${PORTS_SHARED}/src/pc_settings.cpp PROPERTIES COMPILE_OPTIONS "-gcodeview;-gline-tables-only")
+endif()
 
 # Native D3D11 renderer (src/native_gpu): no GPU emulation plugin.
 target_link_libraries(bf2mc PRIVATE rex::xxhash)

@@ -34,5 +34,59 @@
       "url": "https://github.com/batatinhafcbatatinha-pixel/port-installer.git",
       "commit": "7c3b4ad5d353cf4609d1c00ab96168a3d16e084f"
     }
+  },
+  "linux": {
+    "play": "Play.sh",
+    "exe": ".local/build/fifastreet3",
+    "tools": [
+      "cmake",
+      "ninja"
+    ],
+    "steps": [
+      {
+        "name": "Build the native profile",
+        "run": [
+          "{python}",
+          "../../tools/native_profile.py",
+          "build",
+          "--profile",
+          "{root}",
+          "--game-files",
+          "{game_files}",
+          "--jobs",
+          "{jobs}"
+        ],
+        "reuse_if": ".local/generation-complete.json",
+        "reuse_arg": "--reuse-generated",
+        "retry_if": ".local/build/build.ninja"
+      }
+    ]
+  },
+  "macos": {
+    "play": "Play.sh",
+    "exe": ".local/build/fifastreet3",
+    "tools": [
+      "cmake",
+      "ninja"
+    ],
+    "steps": [
+      {
+        "name": "Build the native profile",
+        "run": [
+          "{python}",
+          "../../tools/native_profile.py",
+          "build",
+          "--profile",
+          "{root}",
+          "--game-files",
+          "{game_files}",
+          "--jobs",
+          "{jobs}"
+        ],
+        "reuse_if": ".local/generation-complete.json",
+        "reuse_arg": "--reuse-generated",
+        "retry_if": ".local/build/build.ninja"
+      }
+    ]
   }
 }

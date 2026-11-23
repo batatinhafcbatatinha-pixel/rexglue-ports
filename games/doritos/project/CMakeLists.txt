@@ -66,3 +66,15 @@ if(WIN32 AND EXISTS "${DXVK_DIR}/x64/d3d11.dll")
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXVK_DIR}/x64/d3d11.dll" "${DXVK_DIR}/x64/dxgi.dll"
                 "$<TARGET_FILE_DIR:doritoscrashcourse>/vulkan/")
 endif()
+
+if(NOT WIN32)
+    get_property(_profile_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    include(${PORTS_SHARED}/src/platform/native_shader_compiler.cmake)
+    foreach(_profile_target IN LISTS _profile_targets)
+        get_target_property(_profile_type ${_profile_target} TYPE)
+        if(_profile_type STREQUAL "EXECUTABLE" OR _profile_type STREQUAL "STATIC_LIBRARY"
+           OR _profile_type STREQUAL "SHARED_LIBRARY" OR _profile_type STREQUAL "OBJECT_LIBRARY")
+            target_link_libraries(${_profile_target} PRIVATE native_shader_compiler)
+        endif()
+    endforeach()
+endif()

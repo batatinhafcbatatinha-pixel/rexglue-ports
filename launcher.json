@@ -245,5 +245,105 @@
    ]
   }
  },
- "generic_label": "^[0-9A-F]{8}$"
+ "generic_label": "^[0-9A-F]{8}$",
+ "linux": {
+  "setup": "tools/port-installer/setup/setup.sh",
+  "packages": {
+   "apt": [
+    "clang-20",
+    "pkg-config",
+    "libfontconfig1-dev",
+    "libfreetype-dev",
+    "libvulkan-dev",
+    "libsdl3-dev"
+   ],
+   "dnf": [
+    "clang",
+    "pkgconf-pkg-config",
+    "fontconfig-devel",
+    "freetype-devel",
+    "vulkan-loader-devel",
+    "SDL3-devel"
+   ],
+   "pacman": [
+    "clang",
+    "pkgconf",
+    "fontconfig",
+    "freetype2",
+    "vulkan-headers",
+    "vulkan-icd-loader",
+    "sdl3"
+   ],
+   "zypper": [
+    "clang",
+    "pkg-config",
+    "fontconfig-devel",
+    "freetype2-devel",
+    "vulkan-devel",
+    "SDL3-devel"
+   ]
+  },
+  "deps": {
+   "buildtools_gb": 0.5,
+   "python_gb": 0.1,
+   "tools": [
+    {
+     "id": "llvm",
+     "name": "Clang",
+     "check": null,
+     "gb": 0
+    },
+    {
+     "id": "cmake",
+     "name": "CMake 3.31.12",
+     "check": ".local/tools/cmake-3.31.12/bin/cmake",
+     "gb": 0.1
+    },
+    {
+     "id": "ninja",
+     "name": "Ninja 1.13.2",
+     "check": ".local/tools/ninja-1.13.2/ninja",
+     "gb": 0.01
+    }
+   ]
+  },
+  "generic": null
+ },
+ "macos": {
+  "setup": "tools/port-installer/setup/setup.sh",
+  "packages": {
+   "brew": [
+    "llvm",
+    "pkg-config",
+    "fontconfig",
+    "freetype",
+    "sdl3"
+   ]
+  },
+  "deps": {
+   "buildtools_gb": 1.5,
+   "python_gb": 0.1,
+   "tools": [
+    {
+     "id": "llvm",
+     "name": "Clang",
+     "check": null,
+     "gb": 0
+    },
+    {
+     "id": "cmake",
+     "name": "CMake 3.31.12",
+     "check": ".local/tools/cmake-3.31.12/CMake.app/Contents/bin/cmake",
+     "gb": 0.1
+    },
+    {
+     "id": "ninja",
+     "name": "Ninja 1.13.2",
+     "check": ".local/tools/ninja-1.13.2/ninja",
+     "gb": 0.01
+    }
+   ]
+  },
+  "generic": null
+ }
 }
