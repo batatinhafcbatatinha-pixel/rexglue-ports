@@ -592,7 +592,8 @@ def input_options(port):
     """Controller options from input.ini (%APPDATA%/port-launcher, then the port folder; the launcher's Controllers
     page writes them). The runtime reads its pads itself through SDL3: the player's remaps reach it as an SDL mapping
     file (the controller database with them appended, so they win), and vibration as its own option. Which
-    controller is player 1, dead zones and sensitivities have no counterpart in this runtime."""
+    controller is player 1 and stick sensitivity have no counterpart in this runtime; the dead zone and the
+    mouse sensitivity do."""
     import configparser
     cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'), interpolation=None, strict=False)
     cfg.optionxform = str
@@ -603,6 +604,18 @@ def input_options(port):
         return []
     section = cfg['input'] if cfg.has_section('input') else {}
     out = ['--vibration' if str(section.get('vibration', '1')).strip() != '0' else '--no-vibration']
+    def percent(key, low, high):
+        try:
+            return min(max(int(str(section.get(key, '')).strip()), low), high)
+        except ValueError:
+            return None
+    # Only what the player set: the runtime keeps its own defaults otherwise.
+    dead = percent('stick_deadzone', 0, 50)
+    if dead is not None:   # the runtime's dead zones are a fraction of the stick's range
+        out += [f'--left_stick_deadzone_percentage={dead / 100:.2f}', f'--right_stick_deadzone_percentage={dead / 100:.2f}']
+    mouse = percent('mouse_sensitivity', 10, 500)
+    if mouse is not None:  # mouse look (keyboard and mouse mode): its multiplier, 100% = 1
+        out.append(f'--mnk_sensitivity={mouse / 100:.2f}')
     mappings = [v.strip() for k, v in section.items() if k.lower().startswith('mapping.') and v.strip()]
     database = port.exe.parent / 'gamecontrollerdb.txt'
     if mappings or database.is_file():
