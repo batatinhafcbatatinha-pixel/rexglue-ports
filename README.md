@@ -99,8 +99,6 @@ Shared layers (`shared/src`):
 
 Each game's `project/src/port_game.h` sets `PORT_GAME` (ids in `shared/src/port_games.h`) and the guest addresses
 the shared code needs; behaviour that differs between games is selected with `#if PORT_GAME == PORT_GAME_<NAME>`.
-The shared files were merged from the games' former copies and checked so that every game compiles the same code
-as before.
 
 ## License
 
