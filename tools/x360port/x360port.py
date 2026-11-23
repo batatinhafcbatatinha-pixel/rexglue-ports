@@ -312,6 +312,11 @@ def generic_project(port):
     mark = '# x360port fallback\n'
     if mark in text:
         text = text[:text.index(mark)]
+    # SDL's controller database next to the game, for input_options (port_input.cmake, shared with the others).
+    if '# x360port controllers' not in text:
+        text += ('# x360port controllers\n'
+                 f'include("{(REPO / "third_party/port_input/port_input.cmake").as_posix()}")\n'
+                 f'port_input_stage({NAME})\n')
     if uc:
         text += (mark +
                  f'target_compile_definitions({NAME} PRIVATE X360PORT_FALLBACK)\n'
@@ -583,6 +588,31 @@ def video_options(port):
     return out
 
 
+def input_options(port):
+    """Controller options from input.ini (%APPDATA%/port-launcher, then the port folder; the launcher's Controllers
+    page writes them). The runtime reads its pads itself through SDL3: the player's remaps reach it as an SDL mapping
+    file (the controller database with them appended, so they win), and vibration as its own option. Which
+    controller is player 1, dead zones and sensitivities have no counterpart in this runtime."""
+    import configparser
+    cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'), interpolation=None, strict=False)
+    cfg.optionxform = str
+    files = [Path(os.environ.get('APPDATA', '')) / 'port-launcher/input.ini', port.dir / 'input.ini']
+    try:
+        cfg.read([f for f in files if f.is_file()], encoding='utf-8')
+    except configparser.Error:
+        return []
+    section = cfg['input'] if cfg.has_section('input') else {}
+    out = ['--vibration' if str(section.get('vibration', '1')).strip() != '0' else '--no-vibration']
+    mappings = [v.strip() for k, v in section.items() if k.lower().startswith('mapping.') and v.strip()]
+    database = port.exe.parent / 'gamecontrollerdb.txt'
+    if mappings or database.is_file():
+        merged = port.build / 'controllers.txt'
+        base = database.read_text(encoding='utf-8', errors='replace') if database.is_file() else ''
+        merged.write_text(base + '\n# input.ini remaps\n' + '\n'.join(mappings) + '\n', encoding='utf-8')
+        out.append(f'--hid_mappings_file={merged}')
+    return out
+
+
 def step_play(port, args):
     if not port.exe.is_file():
         raise SystemExit('The game is not built yet: install it from the launcher.')
@@ -590,7 +620,8 @@ def step_play(port, args):
     # player's own package is the full game.
     licensed = [] if any(a.startswith('--license_mask') for a in args.extra) else ['--license_mask=1']
     given = {a.split('=', 1)[0].lstrip('-').removeprefix('no-') for a in args.extra if a.startswith('--')}
-    video = [a for a in video_options(port) if a.split('=', 1)[0].lstrip('-').removeprefix('no-') not in given]
+    video = [a for a in video_options(port) + input_options(port)
+             if a.split('=', 1)[0].lstrip('-').removeprefix('no-') not in given]
     r = subprocess.run([str(port.exe), '--game_data_root=' + str(port.files)] + licensed + video + args.extra,
                        cwd=port.exe.parent)
     sys.exit(r.returncode)
