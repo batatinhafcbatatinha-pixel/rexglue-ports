@@ -200,6 +200,38 @@ def declare_functions(manifest, addresses, note=None):
     return len(new)
 
 
+# The fallback emulator's CPU: Unicorn's own Windows build (the PyPI wheel carries unicorn.dll and its headers),
+# pinned by hash.
+UNICORN = ('2.1.1', 'unicorn-2.1.1-py2.py3-none-win_amd64.whl',
+           'f0ebcfaba67ef0ebcd05ee3560268f1c6f683bdd08ff496888741a163d29735d')
+
+
+def unicorn_dir():
+    """Unicorn for the fallback emulator (.local/unicorn), fetched once; None when unavailable."""
+    dest = LOCAL / 'unicorn'
+    if (dest / 'lib/unicorn.dll').is_file():
+        return dest
+    if os.name != 'nt':
+        return None
+    version, wheel_name, sha = UNICORN
+    tmp = LOCAL / 'unicorn-wheel'
+    shutil.rmtree(tmp, ignore_errors=True)
+    r = subprocess.run([sys.executable, '-m', 'pip', 'download', f'unicorn=={version}', '--no-deps', '--only-binary=:all:',
+                        '--platform', 'win_amd64', '-d', str(tmp), '-q'], capture_output=True, text=True)
+    wheel = tmp / wheel_name
+    if r.returncode or not wheel.is_file() or hashlib.sha256(wheel.read_bytes()).hexdigest() != sha:
+        log('- Unicorn (fallback emulator): not available, untranslated code stops the game as before')
+        return None
+    with zipfile.ZipFile(wheel) as z:
+        for name in z.namelist():
+            if name.startswith(('unicorn/include/', 'unicorn/lib/')) and not name.endswith('/'):
+                target = dest / name[len('unicorn/'):]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(z.read(name))
+    shutil.rmtree(tmp, ignore_errors=True)
+    return dest
+
+
 def generic_project(port):
     """What rexglue init leaves out for a playable generic port: the SDK's Xenos GPU emulation (staged next to the
     executable and selected unless the command line chooses another) and x360port_host.cpp (low guest memory reads).
@@ -230,7 +262,10 @@ def generic_project(port):
         '    if (config.gpu_plugin.empty()) config.gpu_plugin = "xenos";' + '\n'
         '  }' + '\n'
         '  // x360port scan: X360PORT_DUMP_IMAGE=<file> writes the loaded image and exits.' + '\n'
+        '  // Otherwise the fallback emulator for untranslated code (x360port_host.cpp) gets the image layout.' + '\n'
         '  void OnPostLoadXexImage() override {' + '\n'
+        '    x360port_fallback_init(runtime()->virtual_membase(), PPCImageConfig.image_base,' + '\n'
+        '                           PPCImageConfig.image_size, PPCImageConfig.code_base, PPCImageConfig.code_size);' + '\n'
         '    if (const char* path = std::getenv("X360PORT_DUMP_IMAGE")) {' + '\n'
         '      if (FILE* f = std::fopen(path, "wb")) {' + '\n'
         '        const uint32_t head[4] = {PPCImageConfig.image_base, PPCImageConfig.image_size,' + '\n'
@@ -265,7 +300,25 @@ def generic_project(port):
         text = text.replace('  // void OnPostLoadXexImage() override {}\n', '', 1)
     if '#include <cstdio>' not in text:
         text = text.replace('#include <rex/rex_app.h>\n', '#include <rex/rex_app.h>\n#include <cstdio>\n#include <cstdlib>\n', 1)
+    decl = ('void x360port_fallback_init(uint8_t* membase, uint32_t image_base, uint32_t image_size,'
+            ' uint32_t code_base, uint32_t code_size);  // x360port_host.cpp\n')
+    if decl not in text:
+        text = text.replace('#include <cstdlib>\n', '#include <cstdlib>\n' + decl, 1)
     app.write_text(text, encoding='utf-8')
+    # The fallback emulator: Unicorn's headers for x360port_host.cpp, unicorn.dll next to the game (loaded at run
+    # time). Without Unicorn the port builds as before, and stops at untranslated code as before.
+    uc = unicorn_dir()
+    text = cm.read_text(encoding='utf-8')
+    mark = '# x360port fallback\n'
+    if mark in text:
+        text = text[:text.index(mark)]
+    if uc:
+        text += (mark +
+                 f'target_compile_definitions({NAME} PRIVATE X360PORT_FALLBACK)\n'
+                 f'target_include_directories({NAME} PRIVATE "{(uc / "include").as_posix()}")\n'
+                 f'add_custom_command(TARGET {NAME} POST_BUILD COMMAND ${{CMAKE_COMMAND}} -E copy_if_different\n'
+                 f'  "{(uc / "lib/unicorn.dll").as_posix()}" "$<TARGET_FILE_DIR:{NAME}>")\n')
+    cm.write_text(text, encoding='utf-8')
     if 'src/x360port_host.cpp' not in cm.read_text(encoding='utf-8') or 'GPU_PLUGINS xenos' not in cm.read_text(encoding='utf-8'):
         raise SystemExit('unexpected rexglue init project layout: ' + str(cm))
 
