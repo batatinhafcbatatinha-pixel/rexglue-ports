@@ -555,6 +555,10 @@ vsync = 1
 letterbox = 1
 ; Anisotropic filtering: -1 = the game's own, 1 = 2x, 2 = 4x, 3 = 8x, 4 = 8x, 5 = 16x
 anisotropic = -1
+; GPU: -1 = any, 0, 1, 2... = that DXGI adapter (the launcher lists them by name)
+gpu = -1
+; native = Direct3D 12; vulkan = Direct3D 12 on Vulkan (vkd3d-proton + DXVK, when the graphics card supports Vulkan)
+api = native
 '''
 
 
@@ -585,6 +589,9 @@ def video_options(port):
     aniso = number('anisotropic', -1, -1, 5)
     if aniso >= 0:
         out.append(f'--anisotropic_override={aniso}')
+    gpu = number('gpu', -1, -1, 64)
+    if gpu >= 0:
+        out.append(f'--d3d12_adapter={gpu}')
     return out
 
 
@@ -635,6 +642,17 @@ def step_play(port, args):
     given = {a.split('=', 1)[0].lstrip('-').removeprefix('no-') for a in args.extra if a.startswith('--')}
     video = [a for a in video_options(port) + input_options(port)
              if a.split('=', 1)[0].lstrip('-').removeprefix('no-') not in given]
+    # [video] api = vulkan: Direct3D 12 on Vulkan through vkd3d-proton and DXVK (vulkan_layer.py).
+    import configparser
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import vulkan_layer
+    cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+    try:
+        cfg.read(port.dir / 'pc-settings.ini', encoding='utf-8')
+    except configparser.Error:
+        pass
+    vulkan_layer.stage(port.exe.parent, 'd3d12', cfg.get('video', 'api', fallback='native').strip().lower() == 'vulkan',
+                       REPO / '.local/downloads/vulkan')
     r = subprocess.run([str(port.exe), '--game_data_root=' + str(port.files)] + licensed + video + args.extra,
                        cwd=port.exe.parent)
     sys.exit(r.returncode)
