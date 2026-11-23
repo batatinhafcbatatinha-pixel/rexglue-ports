@@ -538,13 +538,61 @@ def remove_functions(manifest, addresses):
     return len(lines) - len(keep)
 
 
+PC_SETTINGS = '''; PC video settings of this game (tools/x360port play reads them; a command-line option wins).
+[video]
+; Internal resolution: 1 = the game's own (720p), 2 = 1440p, 3 = 2160p (4K). Higher needs a stronger GPU.
+resolution_scale = 1
+; After the frame: none | fxaa | fxaa_extreme (anti-aliasing)
+post_effect = none
+; 1 = vertical sync, 0 = off (lower latency, may tear)
+vsync = 1
+; 1 = keep the game's 16:9 picture with bars; 0 = stretch it to the window (fills ultrawide screens)
+letterbox = 1
+; Anisotropic filtering: -1 = the game's own, 1 = 2x, 2 = 4x, 3 = 8x, 4 = 8x, 5 = 16x
+anisotropic = -1
+'''
+
+
+def video_options(port):
+    """The runtime options for <port>/pc-settings.ini (written with the defaults the first time)."""
+    import configparser
+    ini = port.dir / 'pc-settings.ini'
+    if not ini.is_file():
+        ini.write_text(PC_SETTINGS, encoding='utf-8')
+    cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+    try:
+        cfg.read(ini, encoding='utf-8')
+    except configparser.Error:
+        return []
+    v = cfg['video'] if cfg.has_section('video') else {}
+
+    def number(key, default, low, high):
+        try:
+            return min(high, max(low, int(str(v.get(key, default)).strip())))
+        except ValueError:
+            return default
+
+    out = [f'--resolution_scale={number("resolution_scale", 1, 1, 3)}']
+    effect = str(v.get('post_effect', 'none')).strip().lower()
+    out.append('--swap_post_effect=' + (effect if effect in ('none', 'fxaa', 'fxaa_extreme') else 'none'))
+    out.append('--vsync' if number('vsync', 1, 0, 1) else '--no-vsync')
+    out.append('--present_letterbox' if number('letterbox', 1, 0, 1) else '--no-present_letterbox')
+    aniso = number('anisotropic', -1, -1, 5)
+    if aniso >= 0:
+        out.append(f'--anisotropic_override={aniso}')
+    return out
+
+
 def step_play(port, args):
     if not port.exe.is_file():
         raise SystemExit('The game is not built yet: install it from the launcher.')
     # Xbox Live Arcade games check their license and run as a trial without one (the runtime's default, 0): the
     # player's own package is the full game.
     licensed = [] if any(a.startswith('--license_mask') for a in args.extra) else ['--license_mask=1']
-    r = subprocess.run([str(port.exe), '--game_data_root=' + str(port.files)] + licensed + args.extra, cwd=port.exe.parent)
+    given = {a.split('=', 1)[0].lstrip('-').removeprefix('no-') for a in args.extra if a.startswith('--')}
+    video = [a for a in video_options(port) if a.split('=', 1)[0].lstrip('-').removeprefix('no-') not in given]
+    r = subprocess.run([str(port.exe), '--game_data_root=' + str(port.files)] + licensed + video + args.extra,
+                       cwd=port.exe.parent)
     sys.exit(r.returncode)
 
 
