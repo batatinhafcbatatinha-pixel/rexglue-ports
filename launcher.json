@@ -70,7 +70,147 @@
     "retry_if": "build/build.ninja"
    }
   ],
-  "buildtools": false
+  "buildtools": false,
+  "settings": {
+   "ini": "pc-settings.ini",
+   "section": "video",
+   "pc_menu": false,
+   "groups": [
+    {
+     "pt": "Vídeo",
+     "en": "Video",
+     "items": [
+      {
+       "key": "resolution_scale",
+       "pt": "Resolução interna",
+       "en": "Internal resolution",
+       "default": 1,
+       "restart": true,
+       "help_pt": "Desenha o jogo em mais pixels. 3x é 4K; pede uma GPU forte.",
+       "help_en": "Draws the game with more pixels. 3x is 4K; it needs a strong GPU.",
+       "choices": [
+        {
+         "v": 1,
+         "pt": "Original (720p)",
+         "en": "Original (720p)"
+        },
+        {
+         "v": 2,
+         "pt": "2x (1440p)",
+         "en": "2x (1440p)"
+        },
+        {
+         "v": 3,
+         "pt": "3x (2160p, 4K)",
+         "en": "3x (2160p, 4K)"
+        }
+       ]
+      },
+      {
+       "key": "post_effect",
+       "pt": "Anti-serrilhado",
+       "en": "Anti-aliasing",
+       "default": 0,
+       "restart": true,
+       "choices": [
+        {
+         "v": 0,
+         "pt": "Desligado",
+         "en": "Off",
+         "word": "none"
+        },
+        {
+         "v": 1,
+         "pt": "FXAA",
+         "en": "FXAA",
+         "word": "fxaa"
+        },
+        {
+         "v": 2,
+         "pt": "FXAA extremo",
+         "en": "FXAA extreme",
+         "word": "fxaa_extreme"
+        }
+       ]
+      },
+      {
+       "key": "vsync",
+       "pt": "Sincronia vertical (vsync)",
+       "en": "Vertical sync (vsync)",
+       "default": 1,
+       "restart": true,
+       "choices": [
+        {
+         "v": 0,
+         "pt": "Desligado",
+         "en": "Off"
+        },
+        {
+         "v": 1,
+         "pt": "Ligado",
+         "en": "On"
+        }
+       ]
+      },
+      {
+       "key": "letterbox",
+       "pt": "Proporção",
+       "en": "Aspect",
+       "default": 1,
+       "restart": true,
+       "help_pt": "Esticar preenche telas ultrawide.",
+       "help_en": "Stretching fills ultrawide screens.",
+       "choices": [
+        {
+         "v": 1,
+         "pt": "16:9 com faixas",
+         "en": "16:9 with bars"
+        },
+        {
+         "v": 0,
+         "pt": "Esticar na janela",
+         "en": "Stretch to the window"
+        }
+       ]
+      },
+      {
+       "key": "anisotropic",
+       "pt": "Filtro anisotrópico",
+       "en": "Anisotropic filtering",
+       "default": -1,
+       "restart": true,
+       "choices": [
+        {
+         "v": -1,
+         "pt": "O do jogo",
+         "en": "The game's"
+        },
+        {
+         "v": 1,
+         "pt": "2x",
+         "en": "2x"
+        },
+        {
+         "v": 2,
+         "pt": "4x",
+         "en": "4x"
+        },
+        {
+         "v": 3,
+         "pt": "8x",
+         "en": "8x"
+        },
+        {
+         "v": 5,
+         "pt": "16x",
+         "en": "16x"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
  },
  "generic_label": "^[0-9A-F]{8}$"
 }
