@@ -8,6 +8,8 @@ and its runtime, Xenos GPU emulation included (the ports in games/ replace that 
 keeps it). A port folder holds game_files/ (the disc, copied and checked by the launcher). Generated files go to
 <port>/project (the ReXGlue project) and <port>/build. Steps (each skips itself when done; --force redoes it):
   sdk        the pinned ReXGlue SDK (tools/x360port/sdk.json), once for the repository (.local/sdk)
+  sdkvk      Windows, optional (long): the same SDK built from source with its Vulkan renderer too
+             (.local/sdk/<folder>-vulkan); games built afterwards can run on Vulkan (pc-settings.ini api = vulkan)
   msvcsdk    Windows: the MSVC C/C++ runtime and the Windows SDK the SDK's libraries were built against, fetched
              with xwin (pinned, SHA-256 checked) into .local/xwin, so LLVM (clang + lld) builds without Visual Studio
   learn      functions a run called that the analysis did not find (the runtime's "[FATAL] Call to invalid or
@@ -83,6 +85,90 @@ def need(name):
 
 def sdk_prefix():
     return LOCAL / 'sdk' / SDK['folder']
+
+
+def vulkan_sdk_prefix():
+    """The SDK built from source with Vulkan (sdkvk), or None when it has not been built."""
+    prefix = LOCAL / 'sdk' / (SDK['folder'] + '-vulkan')
+    return prefix if (prefix / 'vulkan-sdk.txt').is_file() else None
+
+
+def build_prefix():
+    """The SDK a game links against: the one with Vulkan when it is there (it also has Direct3D 12)."""
+    return vulkan_sdk_prefix() or sdk_prefix()
+
+
+def step_sdkvk(port, args):
+    """The pinned SDK built from source with -DREXGLUE_USE_VULKAN=ON (the Windows release ships Direct3D 12 only),
+    with the port patches and a gpu_backend option, installed next to the downloaded one."""
+    if os.name != 'nt':
+        raise SystemExit('sdkvk is for Windows (the Linux and macOS SDKs already have Vulkan)')
+    source = PIN['sdk_source']
+    prefix = LOCAL / 'sdk' / (SDK['folder'] + '-vulkan')
+    if (prefix / 'vulkan-sdk.txt').is_file() and not args.force:
+        log('- ReXGlue SDK with Vulkan: ' + str(prefix))
+        return
+    need('git'), need('cmake'), need('ninja')
+    clang, clangxx = need('clang' + EXE), need('clang++' + EXE)
+    step_msvcsdk(port, args)
+    os.environ.update(xwin_env())
+    tree = LOCAL / 'sdk-src' / 'sdk'
+    if not (tree / '.git').is_dir():
+        tree.mkdir(parents=True, exist_ok=True)
+        run(['git', 'init', '-q', tree])
+        run(['git', '-C', tree, 'remote', 'add', 'origin', source['repo']])
+    run(['git', '-C', tree, 'fetch', '-q', '--depth', '1', 'origin', source['commit']])
+    run(['git', '-C', tree, 'checkout', '-q', '-f', source['commit']])
+    run(['git', '-C', tree, 'submodule', 'update', '-q', '--init', '--recursive', '--depth', '1', '--jobs', '4'])
+    # Git without symlink rights writes a symlink as a text file holding its target: put the target there.
+    links = subprocess.run(['git', '-C', str(tree), 'submodule', 'foreach', '--recursive', '--quiet',
+                            'git ls-files -s | grep "^120000" | cut -f2 | sed "s|^|$displaypath/|" || true'],
+                           capture_output=True, text=True).stdout.split()
+    for rel in links:
+        f = tree / rel
+        if f.is_file() and f.stat().st_size < 512:
+            target = (f.parent / f.read_text(encoding='utf-8', errors='replace').strip()).resolve()
+            if target.is_file():
+                shutil.copyfile(target, f)
+            elif target.is_dir():
+                f.unlink()
+                shutil.copytree(target, f)
+    for patch in SDK.get('patches', []) + source.get('patches', []):
+        f = tree / patch['file']
+        text = f.read_text(encoding='utf-8')
+        if patch['new'] not in text:
+            if patch['old'] not in text:
+                raise SystemExit(f'Unexpected SDK source: cannot apply {patch["name"]} to {f}')
+            f.write_text(text.replace(patch['old'], patch['new'], 1), encoding='utf-8')
+    build = LOCAL / 'sdk-src' / 'build'
+    run(['cmake', '-S', tree, '-B', build, '-G', 'Ninja Multi-Config', '-DCMAKE_C_COMPILER=' + clang,
+         '-DCMAKE_CXX_COMPILER=' + clangxx, '-DCMAKE_C_FLAGS=-march=x86-64-v2', '-DCMAKE_CXX_FLAGS=-march=x86-64-v2',
+         '-DCMAKE_CXX_STANDARD=23', '-DCMAKE_CONFIGURATION_TYPES=RelWithDebInfo',
+         '-DCMAKE_TRY_COMPILE_CONFIGURATION=Release', '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL',
+         '-DREXGLUE_USE_VULKAN=ON', '-DREXGLUE_USE_D3D12=ON'])
+    run(['cmake', '--build', build, '--config', 'RelWithDebInfo', '--parallel', str(args.jobs)])
+    run(['cmake', '--install', build, '--config', 'RelWithDebInfo', '--prefix', prefix])
+    # The codegen tool ships in Release only and does not depend on the renderer: the downloaded SDK's (same commit).
+    step_sdk(port, args)
+    for name in ('rexglue' + EXE, 'rexruntime.dll', 'TracyClient.dll'):   # the tool and the Release DLLs it loads
+        if (sdk_prefix() / 'bin' / name).is_file():
+            shutil.copy2(sdk_prefix() / 'bin' / name, prefix / 'bin' / name)
+    (prefix / 'lib/cmake/rexglue/rexglueTargets-release.cmake').write_text(
+        '# x360port sdkvk: the codegen tool, copied from the downloaded SDK (the same commit)\n'
+        'set_property(TARGET rex::rexglue APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)\n'
+        'set_target_properties(rex::rexglue PROPERTIES IMPORTED_LOCATION_RELEASE "${_IMPORT_PREFIX}/bin/rexglue.exe")\n'
+        'list(APPEND _cmake_import_check_targets rex::rexglue)\n'
+        'list(APPEND _cmake_import_check_files_for_rex::rexglue "${_IMPORT_PREFIX}/bin/rexglue.exe")\n',
+        encoding='utf-8')
+    # The SDK's install registers its prefix in the CMake user package registry; take that entry out again, so
+    # other projects keep finding what they found before.
+    import hashlib as _hashlib
+    key = _hashlib.md5(prefix.as_posix().lower().encode()).hexdigest()   # as CMake spells the prefix
+    subprocess.run(['reg', 'delete', r'HKCU\Software\Kitware\CMake\Packages\rexglue', '/v', key, '/f'],
+                   capture_output=True)
+    (prefix / 'vulkan-sdk.txt').write_text(f'{source["repo"]} {source["commit"]} Vulkan + Direct3D 12\n',
+                                           encoding='utf-8')
+    log('- ReXGlue SDK with Vulkan: ' + str(prefix))
 
 
 def step_sdk(port, args):
@@ -403,6 +489,17 @@ def step_compile(port, args):
         clang = shutil.which('clang-20') or clang
         clangxx = shutil.which('clang++-20') or clangxx
     need('cmake'), need('ninja')
+    # pc-settings.ini api = vulkan: the runtime's own Vulkan renderer needs the SDK built with it (once, long).
+    if os.name == 'nt' and vulkan_sdk_prefix() is None:
+        import configparser
+        cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+        try:
+            cfg.read(port.dir / 'pc-settings.ini', encoding='utf-8')
+        except configparser.Error:
+            pass
+        if cfg.get('video', 'api', fallback='native').strip().lower() == 'vulkan':
+            log('Vulkan chosen: building the SDK with its Vulkan renderer (once; this takes a while)')
+            step_sdkvk(port, args)
     generic_project(port)
     extra = []
     if os.name == 'nt' and not msvc_env_present():
@@ -413,7 +510,11 @@ def step_compile(port, args):
                  '-DCMAKE_TRY_COMPILE_CONFIGURATION=Release']   # xwin brings the release runtime only
     run(['cmake', '-S', port.project, '-B', port.build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=RelWithDebInfo',
          '-DCMAKE_C_COMPILER=' + clang, '-DCMAKE_CXX_COMPILER=' + clangxx, *extra,
-         '-DCMAKE_PREFIX_PATH=' + sdk_prefix().as_posix(), '-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=' + port.build.as_posix()])
+         '-DCMAKE_PREFIX_PATH=' + build_prefix().as_posix(),
+         '-Drexglue_DIR=' + (build_prefix() / 'lib/cmake/rexglue').as_posix(),
+         '-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=' + port.build.as_posix()])
+    # Which SDK this build links (play passes the Vulkan choice only to a runtime that has it).
+    (port.build / 'sdk-prefix.txt').write_text(str(build_prefix()) + '\n', encoding='utf-8')
     run(['cmake', '--build', port.build, '--parallel', str(args.jobs), '--target', NAME])
     step_scan(port, args)
 
@@ -651,14 +752,19 @@ def step_play(port, args):
         cfg.read(port.dir / 'pc-settings.ini', encoding='utf-8')
     except configparser.Error:
         pass
-    vulkan_layer.stage(port.exe.parent, 'd3d12', cfg.get('video', 'api', fallback='native').strip().lower() == 'vulkan',
-                       REPO / '.local/downloads/vulkan')
+    want_vulkan = cfg.get('video', 'api', fallback='native').strip().lower() == 'vulkan'
+    linked = port.build / 'sdk-prefix.txt'
+    native_vulkan = linked.is_file() and Path(linked.read_text(encoding='utf-8').strip()).name.endswith('-vulkan')
+    if native_vulkan and not any(a.startswith('--gpu_backend') for a in args.extra):
+        # The runtime has its own Vulkan renderer (sdkvk): no translation layer.
+        video.append('--gpu_backend=' + ('vulkan' if want_vulkan else 'd3d12'))
+    vulkan_layer.stage(port.exe.parent, 'd3d12', want_vulkan and not native_vulkan, REPO / '.local/downloads/vulkan')
     r = subprocess.run([str(port.exe), '--game_data_root=' + str(port.files)] + licensed + video + args.extra,
                        cwd=port.exe.parent)
     sys.exit(r.returncode)
 
 
-STEPS = {'sdk': step_sdk, 'msvcsdk': step_msvcsdk, 'init': step_init, 'learn': step_learn, 'codegen': step_codegen, 'prepare': step_prepare,
+STEPS = {'sdk': step_sdk, 'sdkvk': step_sdkvk, 'msvcsdk': step_msvcsdk, 'init': step_init, 'learn': step_learn, 'codegen': step_codegen, 'prepare': step_prepare,
          'compile': step_compile, 'play': step_play,
          'all': lambda p, a: (step_prepare(p, a), step_compile(p, a))}
 

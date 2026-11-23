@@ -22,5 +22,24 @@
     "url": "https://github.com/rexglue/rexglue-sdk/releases/download/nightly-20261002-bd833a2a/rexglue-sdk-0.10.0.24-dev.gbd833a2-mac-amd64.zip",
     "sha256": "17bdcebef6083b0cf01fede41fa5603d2d4c5f3049f675a02f20daa3532bc2a3",
     "folder": "mac-amd64"
+  },
+  "sdk_source": {
+    "repo": "https://github.com/rexglue/rexglue-sdk.git",
+    "commit": "bd833a2ab69d305f99ddf57418fc38ffec8af93d",
+    "note": "the pinned SDK built from source with its Vulkan renderer (x360port sdkvk); Windows builds ship D3D12 only",
+    "patches": [
+      {
+        "name": "gpu-backend-cvar",
+        "file": "src/ui/rex_app.cpp",
+        "old": "    .lifecycle(rex::cvar::Lifecycle::kInitOnly);\n\nnamespace rex {",
+        "new": "    .lifecycle(rex::cvar::Lifecycle::kInitOnly);\n// Port patch: which of the plugin's renderers to use when it has more than one.\nREXCVAR_DEFINE_STRING(gpu_backend, \"any\", \"GPU\",\n                      \"Renderer of the GPU plugin: any (Direct3D 12 first where built), d3d12 or vulkan\")\n    .lifecycle(rex::cvar::Lifecycle::kInitOnly);\n\nnamespace rex {"
+      },
+      {
+        "name": "gpu-backend-use",
+        "file": "src/ui/rex_app.cpp",
+        "old": "    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);",
+        "new": "    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, REXCVAR_GET(gpu_backend));"
+      }
+    ]
   }
 }
