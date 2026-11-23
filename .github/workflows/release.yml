@@ -66,6 +66,7 @@ jobs:
         include:
           - { platform: windows, os: windows-latest }
           - { platform: linux, os: ubuntu-latest }
+          - { platform: macos, os: ubuntu-latest }
     runs-on: ${{ matrix.os }}
     steps:
       # Text files as the platform expects them: CRLF in the Windows ZIP, LF in the others (.gitattributes wins).
@@ -122,7 +123,7 @@ jobs:
             esac
           done
           notes="$NAME built from the source of commit $GITHUB_SHA.
-          rexglue-ports-windows.zip: the source and Launcher.exe. rexglue-ports-linux.zip: the same source with LF line endings and no launcher (it is a Windows program); build as each game's README describes under Linux. No macOS ZIP: the macOS build files have not been compiled or run yet.
+          rexglue-ports-windows.zip: the source and Launcher.exe. rexglue-ports-linux.zip / rexglue-ports-macos.zip: the same source with LF line endings and no launcher (it is a Windows program); build as docs/LINUX_MACOS.md describes (the macOS build files have not been compiled or run yet).
           Unzip and keep the folder; the Windows ZIP has Launcher.exe at its root, next to launcher.json.
           Source code and configuration only: no game data, no generated game code. The game always comes from your own disc.
 

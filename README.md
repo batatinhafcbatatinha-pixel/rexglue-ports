@@ -1,6 +1,6 @@
 # rexglue-ports
 
-**Download:** [Windows](https://github.com/batatinhafcbatatinha-pixel/rexglue-ports/releases/latest/download/rexglue-ports-windows.zip) (source + `Launcher.exe`: unzip, open `Launcher.exe`) · [Linux](https://github.com/batatinhafcbatatinha-pixel/rexglue-ports/releases/latest/download/rexglue-ports-linux.zip) (source only, LF line endings, no launcher: build as the game's README says under Linux). No macOS ZIP yet: its build files are untested.
+**Download:** [Windows](https://github.com/batatinhafcbatatinha-pixel/rexglue-ports/releases/latest/download/rexglue-ports-windows.zip) (source + `Launcher.exe`: unzip, open `Launcher.exe`) · [Linux](https://github.com/batatinhafcbatatinha-pixel/rexglue-ports/releases/latest/download/rexglue-ports-linux.zip) · [macOS](https://github.com/batatinhafcbatatinha-pixel/rexglue-ports/releases/latest/download/rexglue-ports-macos.zip) (source only, LF line endings, no launcher: build as [docs/LINUX_MACOS.md](docs/LINUX_MACOS.md) says; the macOS build files are untested).
 
 Native PC ports of Xbox 360 games, **built from your own disc** on top of the
 [ReXGlue](https://github.com/rexglue) static recompiler (PowerPC to C++). **No game content is stored here: no disc
